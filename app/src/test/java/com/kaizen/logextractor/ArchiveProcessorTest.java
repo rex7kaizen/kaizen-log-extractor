@@ -185,6 +185,22 @@ public class ArchiveProcessorTest {
     }
 
     @Test
+    public void onlySkipsRar5ContinuationWhenEarlierVolumeIsMissing() {
+        assertTrue(ArchiveProcessor.shouldSkipUnavailableRarContinuation(true, true, true));
+        assertFalse(ArchiveProcessor.shouldSkipUnavailableRarContinuation(false, true, true));
+        assertFalse(ArchiveProcessor.shouldSkipUnavailableRarContinuation(true, false, true));
+        assertFalse(ArchiveProcessor.shouldSkipUnavailableRarContinuation(true, true, false));
+        assertFalse(ArchiveProcessor.shouldSkipUnavailableRarContinuation(false, false, false));
+    }
+
+    @Test
+    public void skipsSolidRarEntriesUntilDecoderContextCanBeReset() {
+        assertTrue(ArchiveProcessor.shouldSkipRarEntryWithUnavailableSolidContext(true, true));
+        assertFalse(ArchiveProcessor.shouldSkipRarEntryWithUnavailableSolidContext(true, false));
+        assertFalse(ArchiveProcessor.shouldSkipRarEntryWithUnavailableSolidContext(false, true));
+    }
+
+    @Test
     public void laterSevenZVolumeCanBeIdentifiedWithoutContainerSignature() throws Exception {
         File input = File.createTempFile("kaizen-later-volume", ".bin");
         try {

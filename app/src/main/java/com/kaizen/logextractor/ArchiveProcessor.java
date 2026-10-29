@@ -151,7 +151,7 @@ final class ArchiveProcessor {
                         filterZip(volumes, baseName(originalName), mode, output, stats);
                         break;
                     case RAR:
-                        filterRar(volumes.get(0), mode, output, stats);
+                        filterRar(volumes.get(0), mode, output, stats, hasMissingLeadingVolume(volumes));
                         break;
                     case SEVEN_Z:
                         filterSevenZ(volumes, mode, output, stats);
@@ -277,6 +277,20 @@ final class ArchiveProcessor {
                 || isLaterNumberedVolume(name, RAW_ZIP_PART, 1);
     }
 
+    /**
+     * A RAR entry marked split-before starts in an unavailable earlier volume when processing
+     * begins mid-set. Such an entry must be omitted before creating an output ZIP entry.
+     */
+    static boolean shouldSkipUnavailableRarContinuation(boolean missingLeadingVolume,
+                                                         boolean splitBefore, boolean rar5Entry) {
+        return missingLeadingVolume && splitBefore && rar5Entry;
+    }
+
+    /** Once a missing RAR5 continuation is skipped, solid entries need its unavailable decoder state. */
+    static boolean shouldSkipRarEntryWithUnavailableSolidContext(boolean missingSolidContext, boolean solid) {
+        return missingSolidContext && solid;
+    }
+
     private static String safeMessage(Exception error) {
         String message = error.getMessage();
         return message == null || message.trim().isEmpty()
@@ -387,7 +401,7 @@ final class ArchiveProcessor {
     }
 
     private static void filterRar(File primaryVolume, int mode, ZipArchiveOutputStream output,
-                                  Stats stats) throws Exception {
+                                  Stats stats, boolean missingLeadingVolume) throws Exception {
         Set<String> directories = new HashSet<>();
         Set<String> files = new HashSet<>();
         long[] expanded = {0L};
@@ -396,6 +410,7 @@ final class ArchiveProcessor {
             if (archive.isPasswordProtected()) throw new IOException("Parola korumalı RAR arşivleri bu sürümde desteklenmiyor.");
             List<FileHeader> headers = archive.getFileHeaders();
             if (headers.size() > MAX_ENTRIES) throw new IOException("Arşiv 100.000 girdiden fazla içeriyor.");
+            boolean unavailableRar5SolidContext = false;
             for (FileHeader header : headers) {
                 stats.scanned++;
                 checkEntryLimit(stats.scanned);
@@ -403,6 +418,21 @@ final class ArchiveProcessor {
                     stats.skipped++;
                     continue;
                 }
+                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
+                if (shouldSkipUnavailableRarContinuation(missingLeadingVolume, header.isSplitBefore(), rar5Entry)) {
+                    // Junrar rejects RAR5 split-before entries when an earlier volume is absent.
+                    // Skip before opening a ZIP entry, so no empty or partial file is written.
+                    stats.skipped++;
+                    unavailableRar5SolidContext = true;
+                    continue;
+                }
+                if (shouldSkipRarEntryWithUnavailableSolidContext(unavailableRar5SolidContext, header.isSolid())) {
+                    // A later solid entry depends on the skipped entry's decoder state. Skip until
+                    // a non-solid entry resets that state; otherwise extraction can fail CRC checks.
+                    stats.skipped++;
+                    continue;
+                }
+                if (!header.isSolid()) unavailableRar5SolidContext = false;
                 String path = safeEntryPath(header.getFileName());
                 if (path == null || !matchesMode(path, mode)) {
                     stats.skipped++;
