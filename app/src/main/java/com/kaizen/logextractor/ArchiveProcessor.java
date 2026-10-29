@@ -95,6 +95,13 @@ final class ArchiveProcessor {
         }
         if (rarName && length >= 7 && isRarSignature(header, length)) return ArchiveType.RAR;
         if (sevenZName && length >= 6 && isSevenZSignature(header)) return ArchiveType.SEVEN_Z;
+
+        // A later split volume does not necessarily begin with the container signature.
+        // Infer its format from the canonical volume name and let the archive reader
+        // determine whether the selected range contains enough data to be readable.
+        if (isLaterNumberedVolume(name, RAR_PART, 1)) return ArchiveType.RAR;
+        if (isLaterNumberedVolume(name, SEVEN_Z_PART, 1)) return ArchiveType.SEVEN_Z;
+        if (isLaterNumberedVolume(name, RAW_ZIP_PART, 1)) return ArchiveType.ZIP;
         throw new IOException("Dosya uzantısı ile arşiv imzası uyuşmuyor veya arşiv eksik. ZIP, JAR, RAR ve 7Z kabul edilir.");
     }
 
@@ -137,19 +144,27 @@ final class ArchiveProcessor {
         Stats stats = new Stats();
         try (ZipArchiveOutputStream output = new ZipArchiveOutputStream(destination)) {
             output.setUseZip64(Zip64Mode.AsNeeded);
-            switch (type) {
-                case ZIP:
-                case JAR:
-                    filterZip(volumes, baseName(originalName), mode, output, stats);
-                    break;
-                case RAR:
-                    filterRar(volumes.get(0), mode, output, stats);
-                    break;
-                case SEVEN_Z:
-                    filterSevenZ(volumes, mode, output, stats);
-                    break;
-                default:
-                    throw new IOException("Desteklenmeyen arşiv türü.");
+            try {
+                switch (type) {
+                    case ZIP:
+                    case JAR:
+                        filterZip(volumes, baseName(originalName), mode, output, stats);
+                        break;
+                    case RAR:
+                        filterRar(volumes.get(0), mode, output, stats);
+                        break;
+                    case SEVEN_Z:
+                        filterSevenZ(volumes, mode, output, stats);
+                        break;
+                    default:
+                        throw new IOException("Desteklenmeyen arşiv türü.");
+                }
+            } catch (Exception e) {
+                if (hasMissingLeadingVolume(volumes)) {
+                    throw new IOException("Seçilen parça(lar) tanındı ve taranmaya çalışıldı, ancak arşiv bu parçalardan tek başına okunamıyor. İçerik başlangıç parçasına veya önceki parçalara bağlı olabilir; varsa eksik önceki parçaları da seç. Ayrıntı: "
+                            + safeMessage(e), e);
+                }
+                throw e;
             }
         }
         if (stats.kept == 0) {
@@ -232,11 +247,40 @@ final class ArchiveProcessor {
     private static List<String> numberedSet(Map<String, String> available, Pattern pattern,
                                             int firstNumber, String selected) throws IOException {
         List<NumberedName> numbered = findNumbered(available, pattern, firstNumber);
-        if (numbered.isEmpty()) throw new IOException("Bölünmüş arşivin ilk parçası bulunamadı.");
-        ensureContiguous(numbered, firstNumber, "Arşiv parçası");
+        if (numbered.isEmpty()) throw new IOException("Seçilen arşiv parçası bulunamadı.");
+        // Do not fail merely because an earlier volume is absent. Begin with the
+        // earliest available volume and scan the selected range in numeric order.
+        // Gaps inside the available range are still rejected because those pieces
+        // would make the byte stream discontinuous.
+        int firstAvailable = numbered.get(0).number;
+        ensureContiguous(numbered, firstAvailable, "Arşiv parçası");
         List<String> result = namesFrom(numbered);
         if (!containsIgnoreCase(result, selected)) throw new IOException("Seçilen parça bu arşiv grubuna ait değil: " + selected);
         return result;
+    }
+
+    private static boolean isLaterNumberedVolume(String name, Pattern pattern, int firstNumber) {
+        Matcher matcher = pattern.matcher(name);
+        if (!matcher.matches()) return false;
+        try {
+            return Integer.parseInt(matcher.group(2)) > firstNumber;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static boolean hasMissingLeadingVolume(List<File> volumes) {
+        if (volumes == null || volumes.isEmpty()) return false;
+        String name = volumes.get(0).getName().toLowerCase(Locale.ROOT);
+        return isLaterNumberedVolume(name, RAR_PART, 1)
+                || isLaterNumberedVolume(name, SEVEN_Z_PART, 1)
+                || isLaterNumberedVolume(name, RAW_ZIP_PART, 1);
+    }
+
+    private static String safeMessage(Exception error) {
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty()
+                ? error.getClass().getSimpleName() : message;
     }
 
     private static List<NumberedName> findNumbered(Map<String, String> available, Pattern pattern,
@@ -389,14 +433,18 @@ final class ArchiveProcessor {
         SeekableByteChannel channel = null;
         SevenZFile sevenZ = null;
         try {
+            SevenZFile.Builder builder;
             if (volumes.size() > 1) {
                 channel = MultiReadOnlySeekableByteChannel.forFiles(volumes.toArray(new File[0]));
-                sevenZ = SevenZFile.builder().setSeekableByteChannel(channel)
-                        .setMaxMemoryLimitKiB(SEVEN_Z_MEMORY_LIMIT_KIB).get();
+                builder = SevenZFile.builder().setSeekableByteChannel(channel);
             } else {
-                sevenZ = SevenZFile.builder().setFile(volumes.get(0))
-                        .setMaxMemoryLimitKiB(SEVEN_Z_MEMORY_LIMIT_KIB).get();
+                builder = SevenZFile.builder().setFile(volumes.get(0));
             }
+            // If an earlier 7z volume is absent, attempt Commons Compress' bounded
+            // end-of-archive recovery. It may recover the file index from later pieces,
+            // but cannot reconstruct payload bytes that are actually missing.
+            sevenZ = builder.setMaxMemoryLimitKiB(SEVEN_Z_MEMORY_LIMIT_KIB)
+                    .setTryToRecoverBrokenArchives(hasMissingLeadingVolume(volumes)).get();
             Set<String> directories = new HashSet<>();
             Set<String> files = new HashSet<>();
             long[] expanded = {0L};

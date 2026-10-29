@@ -10,7 +10,7 @@ Android archive filter with a dark liquid-glass inspired interface. It runs loca
 - Raw numbered ZIP segments such as `.zip.001`, `.zip.002`, ...
 - Classic split ZIP segments named `.z01`, `.z02`, ... plus final `.zip`
 
-If the user selects a later volume (such as `archive.part04.rar`), the app asks for the folder containing the volumes. It orders the pieces and reports missing starting or intermediate parts instead of passing the incomplete selection to the decompressor. The folder can also be selected manually for conventional `.rar` + `.r00` sets. A single later part cannot reconstruct missing data; all required segments must be available.
+If the user selects a later volume (such as `archive.part04.rar` or `archive.7z.004`), the app orders the available pieces and can try scanning a consecutive later range without immediately rejecting it because volume 1/001 is absent. Gaps between available pieces are rejected. For 7Z, bounded end-of-archive recovery is attempted when the starting volume is missing; it may recover the file index, but it cannot reconstruct missing payload data. Other formats may still require the first volume. The folder can also be selected manually for conventional `.rar` + `.r00` sets.
 
 ## Filter modes
 

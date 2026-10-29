@@ -157,9 +157,41 @@ public class ArchiveProcessorTest {
         assertEquals(Arrays.asList("backup.rar", "backup.r00", "backup.r01"), resolved);
     }
 
+    @Test
+    public void laterRarPartsCanBeSelectedWithoutRequiringPartOne() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(
+                Arrays.asList("backup.part4.rar", "backup.part3.rar"), "backup.part4.rar");
+        assertEquals(Arrays.asList("backup.part3.rar", "backup.part4.rar"), resolved);
+    }
+
+    @Test
+    public void laterSevenZPartsCanBeSelectedWithoutRequiring001() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(
+                Arrays.asList("backup.7z.004", "backup.7z.003"), "backup.7z.004");
+        assertEquals(Arrays.asList("backup.7z.003", "backup.7z.004"), resolved);
+    }
+
+    @Test
+    public void laterRawZipPartsCanBeSelectedWithoutRequiring001() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(
+                Arrays.asList("backup.zip.004", "backup.zip.003"), "backup.zip.004");
+        assertEquals(Arrays.asList("backup.zip.003", "backup.zip.004"), resolved);
+    }
+
     @Test(expected = IOException.class)
-    public void missingFirstRarPartFailsClearlyBeforeExtraction() throws Exception {
-        ArchiveProcessor.selectVolumeNames(Arrays.asList("backup.part4.rar", "backup.part2.rar", "backup.part3.rar"), "backup.part4.rar");
+    public void missingIntermediatePartIsStillRejectedWhenStartingLater() throws Exception {
+        ArchiveProcessor.selectVolumeNames(
+                Arrays.asList("backup.7z.003", "backup.7z.005"), "backup.7z.005");
+    }
+
+    @Test
+    public void laterSevenZVolumeCanBeIdentifiedWithoutContainerSignature() throws Exception {
+        File input = File.createTempFile("kaizen-later-volume", ".bin");
+        try {
+            Files.write(input.toPath(), "continuation-data".getBytes(StandardCharsets.UTF_8));
+            assertEquals(ArchiveProcessor.ArchiveType.SEVEN_Z,
+                    ArchiveProcessor.detectType(input, "backup.7z.003"));
+        } finally { input.delete(); }
     }
 
     @Test(expected = IOException.class)
