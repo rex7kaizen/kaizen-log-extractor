@@ -339,12 +339,11 @@ public final class MainActivity extends Activity {
     private void pickArchive() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
+        // Do not apply EXTRA_MIME_TYPES here. Android document providers do not
+        // consistently map .rar files to a MIME type, so the MIME filter can hide
+        // valid RAR archives even when the extension is supported. Validate the
+        // selected filename instead, before accepting it for processing.
         intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                "application/zip", "application/java-archive", "application/x-java-archive",
-                "application/vnd.rar", "application/x-rar-compressed", "application/x-rar",
-                "application/x-7z-compressed", "application/octet-stream"
-        });
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(intent, REQUEST_ARCHIVE);
@@ -386,6 +385,14 @@ public final class MainActivity extends Activity {
             partsTreeUri = null;
             for (Uri uri : uris) {
                 String name = queryDisplayName(uri);
+                if (!isSupportedArchiveName(name)) {
+                    selectedArchives.clear();
+                    archiveNameView.setText("Henüz arşiv seçilmedi");
+                    statusView.setText("Desteklenmeyen dosya: " + name
+                            + ". ZIP, JAR, RAR, 7Z veya desteklenen arşiv parçalarını seç.");
+                    Toast.makeText(this, "Yalnızca arşiv dosyaları seçilebilir.", Toast.LENGTH_LONG).show();
+                    return;
+                }
                 if (!containsSelected(uri)) selectedArchives.add(new PickedArchive(uri, name));
                 try {
                     int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
@@ -657,6 +664,13 @@ public final class MainActivity extends Activity {
             throw new IOException("Geçersiz arşiv parçası adı.");
         }
         return base;
+    }
+
+    private boolean isSupportedArchiveName(String name) {
+        String lower = name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+        return lower.endsWith(".zip") || lower.endsWith(".jar")
+                || lower.endsWith(".rar") || lower.endsWith(".7z")
+                || isSplitVolumeName(lower);
     }
 
     private boolean isSplitVolumeName(String name) {
