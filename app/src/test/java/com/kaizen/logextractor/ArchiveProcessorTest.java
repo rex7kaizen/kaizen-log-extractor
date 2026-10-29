@@ -1,5 +1,7 @@
 package com.kaizen.logextractor;
 
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZOutputFile;
 import org.junit.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -9,7 +11,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.zip.ZipEntry;
@@ -23,8 +27,7 @@ import static org.junit.Assert.assertTrue;
 public class ArchiveProcessorTest {
     @Test
     public void defaultKeepsRegularFilesAndOnlyRequiredParents() throws Exception {
-        File input = zipOf(
-                "kaizen/lmao/hahaha/xd/", null,
+        File input = zipOf("kaizen/lmao/hahaha/xd/", null,
                 "kaizen/hahah/xdxd/xd.txt", "ordinary",
                 "kaizen/hahah/xdxd/cardxdxd.txt", "card",
                 "kaizen/hahah/xfjsifh/cards.txt", "cards",
@@ -37,15 +40,12 @@ public class ArchiveProcessorTest {
                     "kaizen/", "kaizen/hahah/", "kaizen/hahah/xdxd/",
                     "kaizen/hahah/xdxd/xd.txt", "kaizen/hahah/xdxd/cardxdxd.txt",
                     "kaizen/hahah/xfjsifh/", "kaizen/hahah/xfjsifh/cards.txt")), entryNames(output));
-        } finally {
-            input.delete(); output.delete();
-        }
+        } finally { input.delete(); output.delete(); }
     }
 
     @Test
     public void cardsMatchesBasenameCaseInsensitivelyNotParentFolder() throws Exception {
-        File input = zipOf(
-                "kaizen/card/fix.txt", "folder has card only",
+        File input = zipOf("kaizen/card/fix.txt", "folder has card only",
                 "kaizen/hahah/xdxd/xd.txt", "ordinary",
                 "kaizen/hahah/xdxd/cardxdxd.txt", "card",
                 "kaizen/hahah/xfjsifh/cards.txt", "cards",
@@ -58,9 +58,7 @@ public class ArchiveProcessorTest {
                     "kaizen/", "kaizen/hahah/", "kaizen/hahah/xdxd/",
                     "kaizen/hahah/xdxd/cardxdxd.txt", "kaizen/hahah/xfjsifh/",
                     "kaizen/hahah/xfjsifh/cards.txt", "CARD.txt")), entryNames(output));
-        } finally {
-            input.delete(); output.delete();
-        }
+        } finally { input.delete(); output.delete(); }
     }
 
     @Test
@@ -73,9 +71,7 @@ public class ArchiveProcessorTest {
             assertFalse(entryNames(output).contains("../outside.txt"));
             assertTrue(entryNames(output).contains("safe/inside.txt"));
             assertTrue(entryNames(output).contains("safe/"));
-        } finally {
-            input.delete(); output.delete();
-        }
+        } finally { input.delete(); output.delete(); }
     }
 
     @Test
@@ -87,9 +83,7 @@ public class ArchiveProcessorTest {
             assertEquals(1, result.keptFiles);
             assertTrue(entryNames(output).contains("nested/empty.log"));
             assertTrue(entryNames(output).contains("nested/"));
-        } finally {
-            input.delete(); output.delete();
-        }
+        } finally { input.delete(); output.delete(); }
     }
 
     @Test(expected = IOException.class)
@@ -98,19 +92,79 @@ public class ArchiveProcessorTest {
         try {
             Files.write(input.toPath(), "not a zip".getBytes(StandardCharsets.UTF_8));
             ArchiveProcessor.filter(input, "notes.txt", ArchiveProcessor.MODE_DEFAULT, new ByteArrayOutputStream());
-        } finally {
-            input.delete();
-        }
+        } finally { input.delete(); }
     }
 
     @Test(expected = ArchiveProcessor.NoMatchesException.class)
     public void directoryOnlyArchiveDoesNotProduceEmptyResult() throws Exception {
         File input = zipOf("empty/", null, "empty/deep/", null);
+        try { ArchiveProcessor.filter(input, "folders.zip", ArchiveProcessor.MODE_DEFAULT, new ByteArrayOutputStream()); }
+        finally { input.delete(); }
+    }
+
+    @Test
+    public void jarSignatureIsAcceptedAsZipContainer() throws Exception {
+        File input = zipOf("data.txt", "jar payload");
+        try { assertEquals(ArchiveProcessor.ArchiveType.JAR, ArchiveProcessor.detectType(input, "sample.jar")); }
+        finally { input.delete(); }
+    }
+
+    @Test
+    public void sevenZFilesAreFilteredIntoZipOutput() throws Exception {
+        File input = sevenZOf("nested/card-data.txt", "seven zip payload");
+        File output = File.createTempFile("kaizen-7z-output", ".zip");
         try {
-            ArchiveProcessor.filter(input, "folders.zip", ArchiveProcessor.MODE_DEFAULT, new ByteArrayOutputStream());
-        } finally {
-            input.delete();
-        }
+            ArchiveProcessor.Result result = filterTo(input, "sample.7z", ArchiveProcessor.MODE_CARDS, output);
+            assertEquals("SEVEN_Z", result.archiveType);
+            assertEquals(1, result.keptFiles);
+            assertTrue(entryNames(output).contains("nested/card-data.txt"));
+            assertTrue(entryNames(output).contains("nested/"));
+        } finally { input.delete(); output.delete(); }
+    }
+
+    @Test
+    public void laterRarPartSelectionResolvesAllEarlierPartsInOrder() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(Arrays.asList(
+                "backup.part4.rar", "backup.part2.rar", "backup.part1.rar", "backup.part3.rar"), "backup.part4.rar");
+        assertEquals(Arrays.asList("backup.part1.rar", "backup.part2.rar", "backup.part3.rar", "backup.part4.rar"), resolved);
+    }
+
+    @Test
+    public void splitSevenZipPartsAreOrderedNumerically() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(Arrays.asList(
+                "backup.7z.004", "backup.7z.001", "backup.7z.003", "backup.7z.002"), "backup.7z.004");
+        assertEquals(Arrays.asList("backup.7z.001", "backup.7z.002", "backup.7z.003", "backup.7z.004"), resolved);
+    }
+
+    @Test
+    public void rawZipPartsAreOrderedNumerically() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(Arrays.asList(
+                "backup.zip.003", "backup.zip.001", "backup.zip.002"), "backup.zip.003");
+        assertEquals(Arrays.asList("backup.zip.001", "backup.zip.002", "backup.zip.003"), resolved);
+    }
+
+    @Test
+    public void classicSplitZipUsesDiskPartsThenFinalZip() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(Arrays.asList(
+                "backup.zip", "backup.z02", "backup.z01"), "backup.z01");
+        assertEquals(Arrays.asList("backup.z01", "backup.z02", "backup.zip"), resolved);
+    }
+
+    @Test
+    public void classicRarVolumesIncludeFirstRarAndSortedRParts() throws Exception {
+        List<String> resolved = ArchiveProcessor.selectVolumeNames(Arrays.asList(
+                "backup.r01", "backup.rar", "backup.r00"), "backup.r01");
+        assertEquals(Arrays.asList("backup.rar", "backup.r00", "backup.r01"), resolved);
+    }
+
+    @Test(expected = IOException.class)
+    public void missingFirstRarPartFailsClearlyBeforeExtraction() throws Exception {
+        ArchiveProcessor.selectVolumeNames(Arrays.asList("backup.part4.rar", "backup.part2.rar", "backup.part3.rar"), "backup.part4.rar");
+    }
+
+    @Test(expected = IOException.class)
+    public void missingIntermediateSevenZPartFailsClearlyBeforeExtraction() throws Exception {
+        ArchiveProcessor.selectVolumeNames(Arrays.asList("backup.7z.001", "backup.7z.003"), "backup.7z.003");
     }
 
     private static ArchiveProcessor.Result filterTo(File input, String name, int mode, File output) throws Exception {
@@ -129,6 +183,24 @@ public class ArchiveProcessorTest {
             }
         }
         return file;
+    }
+
+    private static File sevenZOf(String entryName, String payload) throws Exception {
+        File input = File.createTempFile("kaizen-fixture", ".7z");
+        File data = File.createTempFile("kaizen-payload", ".txt");
+        try {
+            Files.write(data.toPath(), payload.getBytes(StandardCharsets.UTF_8));
+            try (SevenZOutputFile sevenZ = new SevenZOutputFile(input)) {
+                SevenZArchiveEntry entry = sevenZ.createArchiveEntry(data, entryName);
+                sevenZ.putArchiveEntry(entry);
+                sevenZ.write(payload.getBytes(StandardCharsets.UTF_8));
+                sevenZ.closeArchiveEntry();
+            }
+            return input;
+        } catch (Exception e) {
+            input.delete();
+            throw e;
+        } finally { data.delete(); }
     }
 
     private static Set<String> entryNames(File archive) throws Exception {

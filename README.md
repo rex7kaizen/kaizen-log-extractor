@@ -1,29 +1,33 @@
 # Kaizen LOG EXTRACTOR
 
-Android app with a soft purple, interactive UI. The app filters a ZIP or RAR archive and writes a **new ZIP** into the user-selected `Kaizen_LOGS` folder. The input archive is never modified.
+Android archive filter with a dark liquid-glass inspired interface. It runs locally on the device, keeps the source archive untouched, and writes a fresh ZIP output into the selected `Internal storage/Kaizen_LOGS` folder.
 
-## Modes
+## Supported formats
 
-- **Default:** keeps all regular files, omitting explicit empty-directory entries. Parent directories are recreated only when a kept file needs them.
-- **Cards:** same behavior, but keeps only files whose **base file name** contains `card`, case-insensitively. A directory name containing `card` does not make a file match.
+- ZIP and JAR (both read as ZIP containers)
+- RAR, including common `.part01.rar` and classic `.rar` + `.r00` volume naming when all volumes are available
+- 7Z, including `.7z.001`, `.7z.002`, ... multi-volume archives
+- Raw numbered ZIP segments such as `.zip.001`, `.zip.002`, ...
+- Classic split ZIP segments named `.z01`, `.z02`, ... plus final `.zip`
 
-## Safety / limitations
+If the user selects a later volume (such as `archive.part04.rar`), the app asks for the folder containing the volumes. It orders the pieces and reports missing starting or intermediate parts instead of passing the incomplete selection to the decompressor. The folder can also be selected manually for conventional `.rar` + `.r00` sets. A single later part cannot reconstruct missing data; all required segments must be available.
 
-- Only `.zip` and `.rar` files with matching archive signatures are accepted; TXT/MP3 and renamed non-archives are rejected.
-- ZIP is read by Java's `ZipFile`; RAR reading uses Junrar 8.1.2. Output is always ZIP.
-- Password-protected RAR archives are not supported in this version.
-- To limit archive-bomb/resource risks, input files are capped at 2 GiB, archives at 100,000 entries, and total emitted uncompressed payload at 1 GiB.
-- Absolute paths and `..` path components are rejected. RAR link entries are not copied. Duplicate file names are skipped.
-- Storage access is granted with Android's system document picker; the app does not request broad all-files access. Create `/storage/emulated/0/Kaizen_LOGS/` in the Android file manager first, then select that exact folder in the app.
-- The source has not been built or device-tested in this bundle. GitHub Actions builds a debug APK and stores it as an artifact on each push to `main`.
+## Filter modes
 
-## Manual behavior checks
+- **All files:** keeps regular payload files and recreates only parent directories needed by retained files; empty directory entries are omitted.
+- **Card match:** same behavior, but only keeps files whose **base file name** contains `card`, case-insensitively. Directory names alone do not match.
 
-1. `kaizen/lmao/hahaha/xd/` only: no output archive is retained because there are no regular files.
-2. `kaizen/hahah/xdxd/xd.txt` in Default: file and its parent directories remain.
-3. `kaizen/hahah/xdxd/xd.txt` in Cards: file is skipped.
-4. `kaizen/hahah/xdxd/cardxdxd.txt` in Cards: file and parents remain.
-5. `kaizen/hahah/xfjsifh/cards.txt` in Cards: file and parents remain.
-6. `kaizen/hahah/xdxd/lmfao/` with no file beneath: omitted.
-7. `CARD.txt` in Cards: kept because the match is case-insensitive.
-8. A `.txt` file with no ZIP/RAR signature: rejected before output creation.
+The output container is ZIP with ZIP64 enabled as needed so individual entries or an output archive can exceed 4 GiB when the receiving app supports ZIP64.
+
+## Safety and resource limits
+
+- Archive file data is copied in bounded buffers; it is never read fully into RAM.
+- Combined input volumes and emitted uncompressed payload are limited to 64 GiB per operation, with an additional cap of 100,000 entries and a 128 MiB 7Z decoder-memory setting. The phone's free storage, filesystem, provider, and archive codec can impose lower limits.
+- ZIP/JAR/7Z/RAR signatures are checked. Loose TXT, MP3, and files that merely have a renamed extension are rejected.
+- Absolute paths, drive-qualified paths, NUL bytes, and `..` traversal components are rejected. ZIP symbolic links and RAR redirection/link entries are skipped. Duplicate paths are ignored.
+- The app uses Android's system document picker rather than broad all-files storage access. Create `Kaizen_LOGS` in internal storage and select that exact output folder.
+- Password-protected RAR files remain unsupported by the current RAR path. Some uncommon archive codecs or damaged files may also fail with a readable error.
+
+## Verification
+
+GitHub Actions is configured to run unit tests and build a debug APK on pushes to `main`. The source patch itself must still pass that CI job and be tested on a real Android device before treating large and split archives as fully verified.

@@ -10,8 +10,8 @@ android {
         applicationId = "com.kaizen.logextractor"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     compileOptions {
@@ -23,5 +23,7 @@ android {
 dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.github.junrar:junrar:8.1.2")
+    implementation("org.apache.commons:commons-compress:1.28.0")
+    implementation("org.tukaani:xz:1.12")
     testImplementation("junit:junit:4.13.2")
 }
