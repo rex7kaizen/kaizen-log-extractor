@@ -96,7 +96,7 @@ public class ArchiveProcessorTest {
     public void nonArchiveTxtIsRejected() throws Exception {
         File input = File.createTempFile("kaizen-not-archive", ".txt");
         try {
-            Files.writeString(input.toPath(), "not a zip", StandardCharsets.UTF_8);
+            Files.write(input.toPath(), "not a zip".getBytes(StandardCharsets.UTF_8));
             ArchiveProcessor.filter(input, "notes.txt", ArchiveProcessor.MODE_DEFAULT, new ByteArrayOutputStream());
         } finally {
             input.delete();
