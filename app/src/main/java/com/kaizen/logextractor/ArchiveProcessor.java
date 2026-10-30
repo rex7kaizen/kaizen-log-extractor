@@ -223,29 +223,32 @@ final class ArchiveProcessor {
             zipOutput.setUseZip64(Zip64Mode.AsNeeded);
             sink = new ZipSink(zipOutput);
         }
-        try {
-            switch (type) {
-                case ZIP:
-                case JAR:
-                    filterZip(volumes, baseName(originalName), mode, sink, stats, progress);
-                    break;
-                case RAR:
-                    filterRar(volumes.get(0), mode, sink, stats, hasMissingLeadingVolume(volumes), progress);
-                    break;
-                case SEVEN_Z:
-                    filterSevenZ(volumes, mode, sink, stats, progress);
-                    break;
-                default:
-                    throw new IOException("Desteklenmeyen arşiv türü.");
+        try (ZipArchiveOutputStream closeableOutput = zipOutput) {
+            try {
+                switch (type) {
+                    case ZIP:
+                    case JAR:
+                        filterZip(volumes, baseName(originalName), mode, sink, stats, progress);
+                        break;
+                    case RAR:
+                        filterRar(volumes.get(0), mode, sink, stats, hasMissingLeadingVolume(volumes), progress);
+                        break;
+                    case SEVEN_Z:
+                        filterSevenZ(volumes, mode, sink, stats, progress);
+                        break;
+                    default:
+                        throw new IOException("Desteklenmeyen arşiv türü.");
+                }
+            } catch (Exception e) {
+                if (e instanceof OperationCancelledException) {
+                    throw e;
+                }
+                if (hasMissingLeadingVolume(volumes)) {
+                    throw new IOException("Seçilen parça(lar) tanındı ve taranmaya çalışıldı, ancak arşiv bu parçalardan tek başına okunamıyor. İçerik başlangıç parçasına veya önceki parçalara bağlı olabilir; varsa eksik önceki parçaları da seç. Ayrıntı: "
+                            + safeMessage(e), e);
+                }
+                throw e;
             }
-        } catch (Exception e) {
-            if (hasMissingLeadingVolume(volumes)) {
-                throw new IOException("Seçilen parça(lar) tanındı ve taranmaya çalışıldı, ancak arşiv bu parçalardan tek başına okunamıyor. İçerik başlangıç parçasına veya önceki parçalara bağlı olabilir; varsa eksik önceki parçaları da seç. Ayrıntı: "
-                        + safeMessage(e), e);
-            }
-            throw e;
-        } finally {
-            if (zipOutput != null) zipOutput.close();
         }
         if (stats.kept == 0) {
             throw new NoMatchesException(mode == MODE_CARDS
