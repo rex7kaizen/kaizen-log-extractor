@@ -16,6 +16,8 @@ import java.util.Enumeration;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
@@ -213,6 +215,56 @@ public class ArchiveProcessorTest {
     @Test(expected = IOException.class)
     public void missingIntermediateSevenZPartFailsClearlyBeforeExtraction() throws Exception {
         ArchiveProcessor.selectVolumeNames(Arrays.asList("backup.7z.001", "backup.7z.003"), "backup.7z.003");
+    }
+
+
+    @Test
+    public void progressReportsCurrentEntryAndReachesOneHundredPercent() throws Exception {
+        File input = zipOf("nested/first.txt", "first payload", "nested/second.txt", "second payload");
+        File output = File.createTempFile("kaizen-progress", ".zip");
+        AtomicInteger lastPercent = new AtomicInteger(-1);
+        AtomicBoolean sawFile = new AtomicBoolean(false);
+        try {
+            ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
+                @Override public boolean isCancelled() { return false; }
+                @Override public void onProgress(ArchiveProcessor.Progress progress) {
+                    assertTrue("Progress must stay between 0 and 100", progress.percent >= 0 && progress.percent <= 100);
+                    assertTrue("Progress must never move backwards", progress.percent >= lastPercent.get());
+                    lastPercent.set(progress.percent);
+                    if ("nested/first.txt".equals(progress.currentEntry)) sawFile.set(true);
+                }
+            };
+            try (FileOutputStream stream = new FileOutputStream(output)) {
+                ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_DEFAULT,
+                        stream, Collections.singletonList(input), listener);
+            }
+            assertTrue("Current file name should be reported", sawFile.get());
+            assertEquals(100, lastPercent.get());
+        } finally { input.delete(); output.delete(); }
+    }
+
+    @Test
+    public void cancellationDuringAnEntryStopsTheArchiveOperation() throws Exception {
+        File input = zipOf("large.txt", "some test data to ensure there are bytes to read", "next.txt", "later data");
+        File output = File.createTempFile("kaizen-cancel", ".zip");
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        try {
+            ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
+                @Override public boolean isCancelled() { return cancelled.get(); }
+                @Override public void onProgress(ArchiveProcessor.Progress progress) {
+                    if ("large.txt".equals(progress.currentEntry) && "Girdi taranıyor".equals(progress.phase)) {
+                        cancelled.set(true);
+                    }
+                }
+            };
+            try (FileOutputStream stream = new FileOutputStream(output)) {
+                ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_DEFAULT,
+                        stream, Collections.singletonList(input), listener);
+            }
+            throw new AssertionError("Expected cancellation to stop extraction");
+        } catch (ArchiveProcessor.OperationCancelledException expected) {
+            assertTrue(cancelled.get());
+        } finally { input.delete(); output.delete(); }
     }
 
     private static ArchiveProcessor.Result filterTo(File input, String name, int mode, File output) throws Exception {

@@ -10,6 +10,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
@@ -39,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MainActivity extends Activity {
     private static final String TAG = "KaizenLogExtractor";
@@ -59,6 +61,9 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<PickedArchive> selectedArchives = new ArrayList<>();
+    private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+    private long lastProgressUpdateMs;
+    private int lastProgressPercent = -1;
     private Uri outputTreeUri;
     private Uri partsTreeUri;
     private int selectedMode = ArchiveProcessor.MODE_DEFAULT;
@@ -73,6 +78,11 @@ public final class MainActivity extends Activity {
     private LinearLayout defaultCard;
     private LinearLayout cardsCard;
     private TextView processButton;
+    private TextView cancelButton;
+    private TextView progressPercentView;
+    private TextView progressPhaseView;
+    private TextView progressFileView;
+    private LinearLayout progressInfo;
     private ProgressBar progressBar;
 
     @Override
@@ -192,11 +202,42 @@ public final class MainActivity extends Activity {
         processButton.setTextSize(15);
         processButton.setPadding(dp(16), dp(17), dp(16), dp(17));
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progressBar.setIndeterminate(true);
+        progressBar.setIndeterminate(false);
+        progressBar.setMax(100);
+        progressBar.setProgress(0);
         progressBar.setVisibility(View.GONE);
-        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(3));
-        progressParams.setMargins(0, dp(12), 0, dp(4));
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(5));
+        progressParams.setMargins(0, dp(12), 0, dp(7));
         page.addView(progressBar, progressParams);
+
+        progressInfo = new LinearLayout(this);
+        progressInfo.setOrientation(LinearLayout.VERTICAL);
+        progressInfo.setVisibility(View.GONE);
+        LinearLayout progressHeading = new LinearLayout(this);
+        progressHeading.setOrientation(LinearLayout.HORIZONTAL);
+        progressHeading.setGravity(Gravity.CENTER_VERTICAL);
+        progressPercentView = text("0%", 13, COLOR_LAVENDER, true);
+        progressPercentView.setMinWidth(dp(42));
+        progressHeading.addView(progressPercentView, new LinearLayout.LayoutParams(-2, -2));
+        progressPhaseView = text("Hazırlanıyor…", 11, COLOR_MUTED, false);
+        progressPhaseView.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        progressHeading.addView(progressPhaseView, new LinearLayout.LayoutParams(0, -2, 1f));
+        progressInfo.addView(progressHeading);
+        progressFileView = text("Dosya: —", 11, COLOR_TEXT, false);
+        progressFileView.setMaxLines(2);
+        progressFileView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams fileParams = new LinearLayout.LayoutParams(-1, -2);
+        fileParams.topMargin = dp(5);
+        progressInfo.addView(progressFileView, fileParams);
+        page.addView(progressInfo, new LinearLayout.LayoutParams(-1, -2));
+
+        cancelButton = addButton(page, "✕   İŞLEMİ İPTAL ET", false, this::cancelProcessing);
+        cancelButton.setVisibility(View.GONE);
+        cancelButton.setTextColor(Color.rgb(255, 193, 205));
+        cancelButton.setBackground(rounded(Color.argb(65, 100, 35, 52), Color.argb(115, 231, 120, 150), 16, true));
+        LinearLayout.LayoutParams cancelParams = (LinearLayout.LayoutParams) cancelButton.getLayoutParams();
+        cancelParams.topMargin = dp(9);
+        cancelButton.setLayoutParams(cancelParams);
         addSpace(page, 10);
 
         LinearLayout resultCard = panel(page, false);
@@ -297,9 +338,11 @@ public final class MainActivity extends Activity {
         button.setClickable(true);
         button.setFocusable(true);
         button.setOnClickListener(v -> {
-            if (busy) return;
-            v.animate().scaleX(0.985f).scaleY(0.985f).setDuration(70)
-                    .withEndAction(() -> v.animate().scaleX(1f).scaleY(1f).setDuration(90).start()).start();
+            if (busy && button != cancelButton) return;
+            if (button != cancelButton) {
+                v.animate().scaleX(0.985f).scaleY(0.985f).setDuration(70)
+                        .withEndAction(() -> v.animate().scaleX(1f).scaleY(1f).setDuration(90).start()).start();
+            }
             action.run();
         });
         parent.addView(button, new LinearLayout.LayoutParams(-1, -2));
@@ -518,23 +561,78 @@ public final class MainActivity extends Activity {
         final Uri folderUri = outputTreeUri;
         final Uri sourceFolderUri = partsTreeUri;
         final int mode = selectedMode;
+        cancelRequested.set(false);
+        lastProgressUpdateMs = 0L;
+        lastProgressPercent = -1;
         setBusy(true, "Arşiv parçaları kontrol ediliyor…");
+        postProgress(0, "İş hazırlanıyor", "Arşiv seçimi", 0, 0, 0);
         worker.execute(() -> {
             File workDir = null;
             DocumentFile outputFile = null;
+            boolean outputCompleted = false;
             try {
+                checkJobCancelled();
                 workDir = new File(getCacheDir(), "kaizen-job-" + System.nanoTime());
                 if (!workDir.mkdirs() && !workDir.isDirectory()) throw new IOException("Geçici çalışma klasörü oluşturulamadı.");
                 List<SourceFile> sources = resolveSources(picked, sourceFolderUri);
                 if (sources.isEmpty()) throw new IOException("Arşiv dosyası veya gerekli parçalar bulunamadı.");
-                List<File> staged = new ArrayList<>();
-                long totalBytes = 0;
+
+                List<Long> sourceSizes = new ArrayList<>();
+                long expectedTotalBytes = 0L;
+                boolean hasReliableTotal = true;
                 for (SourceFile source : sources) {
+                    checkJobCancelled();
+                    long size = querySize(source.uri);
+                    sourceSizes.add(size);
+                    if (size < 0) {
+                        hasReliableTotal = false;
+                    } else {
+                        if (expectedTotalBytes > MAX_INPUT_BYTES - size) {
+                            throw new IOException("Girdi arşivinin toplamı 64 GiB sınırını aşıyor.");
+                        }
+                        expectedTotalBytes += size;
+                    }
+                }
+                if (expectedTotalBytes <= 0L) hasReliableTotal = false;
+
+                List<File> staged = new ArrayList<>();
+                long totalBytes = 0L;
+                long stageBytesCompleted = 0L;
+                for (int i = 0; i < sources.size(); i++) {
+                    checkJobCancelled();
+                    SourceFile source = sources.get(i);
+                    long expectedCurrentBytes = sourceSizes.get(i);
+                    long baseBytes = stageBytesCompleted;
+                    final long expectedAll = expectedTotalBytes;
+                    final boolean reliableTotal = hasReliableTotal;
+                    final long expectedThis = expectedCurrentBytes;
+                    final int sourceIndex = i;
                     File stagedFile = new File(workDir, safeLocalName(source.name));
-                    long copied = copyUriToFile(source.uri, stagedFile, MAX_INPUT_BYTES - totalBytes);
+                    long copied = copyUriToFile(source.uri, stagedFile, MAX_INPUT_BYTES - totalBytes,
+                            copiedBytes -> {
+                                int percent;
+                                if (reliableTotal && expectedAll > 0L) {
+                                    long done = Math.min(expectedAll, baseBytes + copiedBytes);
+                                    percent = (int) Math.min(19L, (done * 20L) / expectedAll);
+                                } else {
+                                    double fraction = expectedThis > 0L
+                                            ? Math.min(1d, (double) copiedBytes / (double) expectedThis)
+                                            : (copiedBytes <= 0L ? 0d : Math.min(0.99d,
+                                                    (double) copiedBytes / ((double) copiedBytes + 32d * 1024d * 1024d)));
+                                    percent = (int) Math.min(19d,
+                                            ((sourceIndex + fraction) * 20d) / sources.size());
+                                }
+                                String detail = source.name + " · " + humanBytes(copiedBytes)
+                                        + (expectedThis > 0L ? " / " + humanBytes(expectedThis) : "");
+                                postProgress(percent, "Arşiv parçaları kopyalanıyor", detail, 0, 0, 0);
+                            });
                     totalBytes += copied;
+                    stageBytesCompleted += copied;
                     staged.add(stagedFile);
                 }
+                checkJobCancelled();
+                postProgress(20, "Arşiv parçaları hazır", "Arşiv başlıkları kontrol ediliyor", 0, 0, 0);
+
                 // Resolve and validate the complete volume set before creating an output document.
                 List<String> stagedNames = new ArrayList<>();
                 for (File file : staged) stagedNames.add(file.getName());
@@ -551,20 +649,33 @@ public final class MainActivity extends Activity {
                         || !isExpectedOutputFolder(folderUri)) {
                     throw new IOException("Kaizen_LOGS klasörüne yazma izni yok. Klasörü yeniden seç.");
                 }
+                checkJobCancelled();
                 String modeName = mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
                 String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
                 String outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
                 outputFile = folder.createFile("application/zip", outputName);
                 if (outputFile == null) throw new IOException("Çıktı ZIP dosyası oluşturulamadı.");
+                ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
+                    @Override public boolean isCancelled() {
+                        return cancelRequested.get() || Thread.currentThread().isInterrupted();
+                    }
+                    @Override public void onProgress(ArchiveProcessor.Progress progress) {
+                        int overall = 20 + (int) ((progress.percent * 79L) / 100L);
+                        postProgress(overall, progress.phase, progress.currentEntry,
+                                progress.scannedEntries, progress.keptFiles, progress.skippedEntries);
+                    }
+                };
                 ArchiveProcessor.Result result;
                 try (OutputStream output = getContentResolver().openOutputStream(outputFile.getUri(), "w")) {
                     if (output == null) throw new IOException("Çıktı dosyası yazma için açılamadı.");
-                    result = ArchiveProcessor.filter(requiredFiles.get(0), picked.get(0).name, mode, output, requiredFiles);
-                } catch (Exception e) {
-                    outputFile.delete();
-                    outputFile = null;
-                    throw e;
+                    checkJobCancelled();
+                    result = ArchiveProcessor.filter(requiredFiles.get(0), picked.get(0).name,
+                            mode, output, requiredFiles, listener);
+                    checkJobCancelled();
                 }
+                // Also honor a cancellation requested while the document provider was closing the output.
+                checkJobCancelled();
+                outputCompleted = true;
                 String savedPath = "/storage/emulated/0/Kaizen_LOGS/" + outputName;
                 runOnUiThread(() -> {
                     setBusy(false, "✦  İşlem tamamlandı\nÇıktı: " + savedPath);
@@ -574,19 +685,127 @@ public final class MainActivity extends Activity {
                     Toast.makeText(this, "İşlem tamamlandı: " + outputName, Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
-                Log.e(TAG, "Archive filtering failed", e);
+                boolean cancelled = cancelRequested.get() || Thread.currentThread().isInterrupted()
+                        || e instanceof ArchiveProcessor.OperationCancelledException;
+                String incompleteOutputName = null;
+                boolean incompleteOutputDeleted = true;
+                if (!outputCompleted && outputFile != null) {
+                    incompleteOutputName = outputFile.getName();
+                    if (incompleteOutputName == null || incompleteOutputName.trim().isEmpty()) {
+                        incompleteOutputName = "oluşturulan çıktı ZIP'i";
+                    }
+                    incompleteOutputDeleted = outputFile.delete();
+                    if (!incompleteOutputDeleted) {
+                        Log.w(TAG, "Could not delete incomplete output file: " + incompleteOutputName);
+                    }
+                    outputFile = null;
+                }
                 String detail = e.getMessage();
                 if (detail == null || detail.trim().isEmpty()) detail = e.getClass().getSimpleName();
+                String cleanupNote = incompleteOutputName == null ? ""
+                        : incompleteOutputDeleted ? "Yarım çıktı silindi."
+                        : "UYARI: Yarım çıktı silinemedi: " + incompleteOutputName;
                 final String message = detail;
-                runOnUiThread(() -> {
-                    setBusy(false, "İşlem tamamlanamadı\n" + message);
-                    statsView.setText("Tamamlanmamış çıktı silindi. Arşiv parçalarını ve depolama alanını kontrol et.");
-                    Toast.makeText(this, message, Toast.LENGTH_LONG).show();
-                });
+                final String finalCleanupNote = cleanupNote;
+                if (cancelled) {
+                    Log.i(TAG, "Archive processing cancelled by user or activity lifecycle");
+                    runOnUiThread(() -> {
+                        setBusy(false, finalCleanupNote.isEmpty() ? "İşlem iptal edildi."
+                                : "İşlem iptal edildi.\n" + finalCleanupNote);
+                        statsView.setText(finalCleanupNote.startsWith("UYARI:")
+                                ? finalCleanupNote + " Lütfen dosyayı elle kontrol et."
+                                : "İptal edildi. Orijinal arşiv korunuyor.");
+                        Toast.makeText(this, finalCleanupNote.startsWith("UYARI:")
+                                ? finalCleanupNote : "İşlem iptal edildi.", Toast.LENGTH_LONG).show();
+                    });
+                } else {
+                    Log.e(TAG, "Archive filtering failed", e);
+                    String fullMessage = finalCleanupNote.isEmpty() ? message : message + "\n" + finalCleanupNote;
+                    runOnUiThread(() -> {
+                        setBusy(false, "İşlem tamamlanamadı\n" + fullMessage);
+                        statsView.setText(finalCleanupNote.isEmpty()
+                                ? "Arşiv parçalarını, dosya erişimini ve depolama alanını kontrol et."
+                                : finalCleanupNote);
+                        Toast.makeText(this, fullMessage, Toast.LENGTH_LONG).show();
+                    });
+                }
             } finally {
                 if (workDir != null) deleteRecursively(workDir);
             }
         });
+    }
+
+    private void cancelProcessing() {
+        if (!busy) return;
+        if (cancelRequested.compareAndSet(false, true)) {
+            cancelButton.setEnabled(false);
+            cancelButton.setText("İPTAL İSTEĞİ GÖNDERİLDİ…");
+            statusView.setText("İptal isteği gönderildi. Güvenli durma noktasında işlem durduruluyor…");
+            progressPhaseView.setText("İptal ediliyor…");
+        }
+    }
+
+    private void checkJobCancelled() throws ArchiveProcessor.OperationCancelledException {
+        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+            throw new ArchiveProcessor.OperationCancelledException();
+        }
+    }
+
+    private void postProgress(int percent, String phase, String currentFile,
+                              int scanned, int kept, int skipped) {
+        if (cancelRequested.get() && !"İptal ediliyor…".equals(phase)) return;
+        int requestedPercent = Math.max(0, Math.min(99, percent));
+        long now = SystemClock.elapsedRealtime();
+        if (lastProgressUpdateMs != 0L && now - lastProgressUpdateMs < 120L) return;
+        int boundedPercent = Math.max(lastProgressPercent, requestedPercent);
+        lastProgressUpdateMs = now;
+        lastProgressPercent = boundedPercent;
+        final int finalPercent = boundedPercent;
+        final String finalPhase = phase == null ? "İşleniyor" : phase;
+        final String finalFile = currentFile == null || currentFile.trim().isEmpty() ? "—" : currentFile;
+        runOnUiThread(() -> {
+            if (!busy || isFinishing()) return;
+            // Ignore progress updates already queued before the user pressed Cancel.
+            if (cancelRequested.get() && !"İptal ediliyor…".equals(finalPhase)) return;
+            progressBar.setIndeterminate(false);
+            progressBar.setProgress(finalPercent);
+            progressPercentView.setText(finalPercent + "%");
+            progressPhaseView.setText(finalPhase);
+            progressFileView.setText("Şu an: " + finalFile);
+            if (scanned > 0 || kept > 0 || skipped > 0) {
+                statsView.setText("Taranan: " + scanned + "  ·  Korunan: " + kept + "  ·  Atlanan: " + skipped);
+            } else if (finalPhase.contains("kopyalanıyor")) {
+                statsView.setText("Kaynak dosyaları geçici alana güvenli biçimde kopyalanıyor.");
+            }
+        });
+    }
+
+    private long querySize(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (index >= 0 && !cursor.isNull(index)) {
+                    long value = cursor.getLong(index);
+                    return value >= 0L ? value : -1L;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not read source size for progress estimation", e);
+        }
+        return -1L;
+    }
+
+    private static String humanBytes(long bytes) {
+        if (bytes < 0L) return "boyut bilinmiyor";
+        if (bytes < 1024L) return bytes + " B";
+        double value = bytes;
+        String[] units = {"B", "KiB", "MiB", "GiB", "TiB"};
+        int unit = 0;
+        while (value >= 1024d && unit < units.length - 1) {
+            value /= 1024d;
+            unit++;
+        }
+        return String.format(Locale.ROOT, "%.1f %s", value, units[unit]);
     }
 
     private List<SourceFile> resolveSources(List<PickedArchive> picked, Uri folderUri) throws IOException {
@@ -596,6 +815,7 @@ public final class MainActivity extends Activity {
             DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
             if (folder == null || !folder.isDirectory() || !folder.canRead()) throw new IOException("Parça klasörü okunamıyor.");
             for (DocumentFile child : folder.listFiles()) {
+                checkJobCancelled();
                 if (!child.isFile() || child.getName() == null) continue;
                 String name = safeLocalName(child.getName());
                 byName.put(name.toLowerCase(Locale.ROOT), new SourceFile(child.getUri(), name));
@@ -630,15 +850,21 @@ public final class MainActivity extends Activity {
         return false;
     }
 
-    private long copyUriToFile(Uri uri, File destination, long remainingLimit) throws IOException {
+    private interface CopyProgress { void onBytesCopied(long bytesCopied); }
+
+    private long copyUriToFile(Uri uri, File destination, long remainingLimit,
+                               CopyProgress copyProgress) throws IOException {
         boolean completed = false;
-        long total = 0;
+        long total = 0L;
         try (InputStream input = getContentResolver().openInputStream(uri);
              OutputStream output = new FileOutputStream(destination)) {
             if (input == null) throw new IOException("Seçilen dosya okunamadı: " + destination.getName());
             byte[] buffer = new byte[128 * 1024];
             int read;
-            while ((read = input.read(buffer)) != -1) {
+            while (true) {
+                checkJobCancelled();
+                read = input.read(buffer);
+                if (read == -1) break;
                 if (read == 0) continue;
                 if (total > remainingLimit - read) throw new IOException("Girdi arşivinin toplamı 64 GiB sınırını aşıyor.");
                 if (destination.getParentFile().getUsableSpace() < read + DISK_RESERVE_BYTES) {
@@ -646,7 +872,9 @@ public final class MainActivity extends Activity {
                 }
                 output.write(buffer, 0, read);
                 total += read;
+                if (copyProgress != null) copyProgress.onBytesCopied(total);
             }
+            checkJobCancelled();
             if (total == 0) throw new IOException("Seçilen dosya boş: " + destination.getName());
             completed = true;
             return total;
@@ -684,9 +912,21 @@ public final class MainActivity extends Activity {
         busy = isBusy;
         statusView.setText(status);
         progressBar.setVisibility(isBusy ? View.VISIBLE : View.GONE);
+        progressInfo.setVisibility(isBusy ? View.VISIBLE : View.GONE);
+        cancelButton.setVisibility(isBusy ? View.VISIBLE : View.GONE);
+        cancelButton.setEnabled(isBusy && !cancelRequested.get());
+        if (!isBusy) cancelButton.setText("✕   İŞLEMİ İPTAL ET");
         processButton.setEnabled(!isBusy);
         processButton.setAlpha(isBusy ? 0.6f : 1f);
         processButton.setText(isBusy ? "İŞLENİYOR…" : "✦   EXTRACT & FILTER");
+        if (isBusy) {
+            progressBar.setIndeterminate(false);
+            progressBar.setMax(100);
+            progressBar.setProgress(0);
+            progressPercentView.setText("0%");
+            progressPhaseView.setText("Başlatılıyor…");
+            progressFileView.setText("Şu an: —");
+        }
     }
 
     private static void deleteRecursively(File file) {
@@ -700,6 +940,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        cancelRequested.set(true);
         super.onDestroy();
         worker.shutdownNow();
     }

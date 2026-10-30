@@ -19,6 +19,12 @@ If the user selects a later volume (such as `archive.part04.rar` or `archive.7z.
 
 The output container is ZIP with ZIP64 enabled as needed so individual entries or an output archive can exceed 4 GiB when the receiving app supports ZIP64.
 
+## Progress and cancellation
+
+- The interface shows a percentage, the current archive entry/file, and running scanned/kept/skipped counts while staging and filtering.
+- Cancel requests are checked during source staging and while streaming ZIP/JAR, RAR, and 7Z entry data. Incomplete output ZIPs are deleted when the document provider allows deletion; if deletion fails, the UI reports the filename so it can be checked manually.
+- The percentage is weighted by selected entry sizes where the format exposes entry metadata. Source copy progress uses document-provider file sizes where available; if a provider omits size metadata, the displayed percentage is an estimate until staging completes.
+
 ## Safety and resource limits
 
 - Archive file data is copied in bounded buffers; it is never read fully into RAM.

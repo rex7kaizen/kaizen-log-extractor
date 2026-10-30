@@ -105,15 +105,57 @@ final class ArchiveProcessor {
         throw new IOException("Dosya uzantısı ile arşiv imzası uyuşmuyor veya arşiv eksik. ZIP, JAR, RAR ve 7Z kabul edilir.");
     }
 
+    interface ProgressListener {
+        boolean isCancelled();
+        void onProgress(Progress progress);
+    }
+
+    static final class Progress {
+        final int percent;
+        final String phase;
+        final String currentEntry;
+        final int scannedEntries;
+        final int keptFiles;
+        final int skippedEntries;
+
+        Progress(int percent, String phase, String currentEntry,
+                 int scannedEntries, int keptFiles, int skippedEntries) {
+            this.percent = percent;
+            this.phase = phase;
+            this.currentEntry = currentEntry;
+            this.scannedEntries = scannedEntries;
+            this.keptFiles = keptFiles;
+            this.skippedEntries = skippedEntries;
+        }
+    }
+
+    static final class OperationCancelledException extends IOException {
+        OperationCancelledException() { super("İşlem kullanıcı tarafından iptal edildi."); }
+    }
+
+    private static final ProgressListener NO_PROGRESS = new ProgressListener() {
+        @Override public boolean isCancelled() { return false; }
+        @Override public void onProgress(Progress progress) { }
+    };
+
     static Result filter(File input, String originalName, int mode, OutputStream destination) throws Exception {
-        return filter(input, originalName, mode, destination, Collections.singletonList(input));
+        return filter(input, originalName, mode, destination, Collections.singletonList(input), null);
     }
 
     /** candidates must contain the selected file and, when present, all sibling volumes, with original names. */
     static Result filter(File input, String originalName, int mode, OutputStream destination,
                          List<File> candidates) throws Exception {
+        return filter(input, originalName, mode, destination, candidates, null);
+    }
+
+    /** Streaming filter with cooperative cancellation and byte-weighted entry progress. */
+    static Result filter(File input, String originalName, int mode, OutputStream destination,
+                         List<File> candidates, ProgressListener listener) throws Exception {
         if (mode != MODE_DEFAULT && mode != MODE_CARDS) throw new IllegalArgumentException("Bilinmeyen filtre modu.");
+        if (destination == null) throw new IOException("Çıktı akışı açılamadı.");
         if (input == null || candidates == null || candidates.isEmpty()) throw new IOException("Arşiv parçaları bulunamadı.");
+        ProgressTracker progress = new ProgressTracker(listener == null ? NO_PROGRESS : listener);
+        progress.checkCancelled();
         List<String> candidateNames = new ArrayList<>();
         Map<String, File> filesByName = new HashMap<>();
         for (File candidate : candidates) {
@@ -148,13 +190,13 @@ final class ArchiveProcessor {
                 switch (type) {
                     case ZIP:
                     case JAR:
-                        filterZip(volumes, baseName(originalName), mode, output, stats);
+                        filterZip(volumes, baseName(originalName), mode, output, stats, progress);
                         break;
                     case RAR:
-                        filterRar(volumes.get(0), mode, output, stats, hasMissingLeadingVolume(volumes));
+                        filterRar(volumes.get(0), mode, output, stats, hasMissingLeadingVolume(volumes), progress);
                         break;
                     case SEVEN_Z:
-                        filterSevenZ(volumes, mode, output, stats);
+                        filterSevenZ(volumes, mode, output, stats, progress);
                         break;
                     default:
                         throw new IOException("Desteklenmeyen arşiv türü.");
@@ -172,6 +214,7 @@ final class ArchiveProcessor {
                     ? "Dosya adında 'card' bulunan bir dosya bulunamadı. Boş çıktı kaydedilmedi."
                     : "Arşivde korunabilecek bir dosya bulunamadı. Boş çıktı kaydedilmedi.");
         }
+        progress.finish(stats);
         return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, volumes.size());
     }
 
@@ -341,7 +384,7 @@ final class ArchiveProcessor {
     }
 
     private static void filterZip(List<File> volumes, String originalName, int mode,
-                                  ZipArchiveOutputStream output, Stats stats) throws IOException {
+                                  ZipArchiveOutputStream output, Stats stats, ProgressTracker progress) throws IOException {
         SeekableByteChannel channel = null;
         ZipFile zip = null;
         try {
@@ -362,25 +405,41 @@ final class ArchiveProcessor {
             Set<String> directories = new HashSet<>();
             Set<String> files = new HashSet<>();
             long[] expanded = {0L};
+            long totalWork = 0L;
+            Enumeration<ZipArchiveEntry> countEntries = zip.getEntries();
+            while (countEntries.hasMoreElements()) {
+                progress.checkCancelled();
+                ZipArchiveEntry entry = countEntries.nextElement();
+                progress.inspectEntry(entry.getName(), stats);
+                totalWork = addWork(totalWork, progressWorkSize(entry.getName(), entry.getSize(),
+                        entry.isDirectory() || entry.isUnixSymlink(), mode));
+            }
+            progress.setTotalWork(totalWork);
             Enumeration<ZipArchiveEntry> entries = zip.getEntries();
             while (entries.hasMoreElements()) {
+                progress.checkCancelled();
                 ZipArchiveEntry entry = entries.nextElement();
                 stats.scanned++;
                 checkEntryLimit(stats.scanned);
+                long size = entry.isDirectory() || entry.isUnixSymlink() ? 0L : entry.getSize();
+                progress.startEntry(entry.getName(), progressWorkSize(entry.getName(), size,
+                        entry.isDirectory() || entry.isUnixSymlink(), mode), stats);
                 if (entry.isDirectory() || entry.isUnixSymlink()) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 String path = safeEntryPath(entry.getName());
                 if (path == null || !matchesMode(path, mode)) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 if (files.contains(path) || directories.contains(path + "/")) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
-                long size = entry.getSize();
                 if (size < 0) throw new IOException("Arşiv girdisinin boyutu okunamadı: " + path);
                 addParentDirectories(path, output, directories, files);
                 files.add(path);
@@ -389,10 +448,11 @@ final class ArchiveProcessor {
                 if (entry.getTime() > 0) outEntry.setTime(entry.getTime());
                 output.putArchiveEntry(outEntry);
                 try (InputStream in = zip.getInputStream(entry)) {
-                    copyLimited(in, output, expanded);
+                    copyLimited(in, output, expanded, progress, stats);
                 }
                 output.closeArchiveEntry();
                 stats.kept++;
+                progress.finishCurrent(stats);
             }
         } finally {
             if (zip != null) zip.close();
@@ -401,7 +461,7 @@ final class ArchiveProcessor {
     }
 
     private static void filterRar(File primaryVolume, int mode, ZipArchiveOutputStream output,
-                                  Stats stats, boolean missingLeadingVolume) throws Exception {
+                                  Stats stats, boolean missingLeadingVolume, ProgressTracker progress) throws Exception {
         Set<String> directories = new HashSet<>();
         Set<String> files = new HashSet<>();
         long[] expanded = {0L};
@@ -410,48 +470,87 @@ final class ArchiveProcessor {
             if (archive.isPasswordProtected()) throw new IOException("Parola korumalı RAR arşivleri bu sürümde desteklenmiyor.");
             List<FileHeader> headers = archive.getFileHeaders();
             if (headers.size() > MAX_ENTRIES) throw new IOException("Arşiv 100.000 girdiden fazla içeriyor.");
+            long totalWork = 0L;
+            boolean sizingSolidContextUnavailable = false;
+            for (FileHeader header : headers) {
+                progress.checkCancelled();
+                progress.inspectEntry(header.getFileName(), stats);
+                long size = header.isDirectory() ? 0L : header.getFullUnpackSize();
+                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
+                boolean missingContinuation = shouldSkipUnavailableRarContinuation(
+                        missingLeadingVolume, header.isSplitBefore(), rar5Entry);
+                boolean unavailableSolidEntry = shouldSkipRarEntryWithUnavailableSolidContext(
+                        sizingSolidContextUnavailable, header.isSolid());
+                boolean excluded = header.isDirectory() || header.getRedirection() != null
+                        || missingContinuation || unavailableSolidEntry;
+                long weight = excluded ? 0L : progressWorkSize(header.getFileName(), size, false, mode);
+                totalWork = addWork(totalWork, weight);
+                if (header.isDirectory() || header.getRedirection() != null) {
+                    // These entries are skipped before the solid-context state is changed below.
+                } else if (missingContinuation) {
+                    sizingSolidContextUnavailable = true;
+                } else if (!header.isSolid()) {
+                    sizingSolidContextUnavailable = false;
+                }
+            }
+            progress.setTotalWork(totalWork);
             boolean unavailableRar5SolidContext = false;
             for (FileHeader header : headers) {
+                progress.checkCancelled();
                 stats.scanned++;
                 checkEntryLimit(stats.scanned);
+                long size = header.isDirectory() ? 0L : header.getFullUnpackSize();
+                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
+                boolean missingContinuation = shouldSkipUnavailableRarContinuation(
+                        missingLeadingVolume, header.isSplitBefore(), rar5Entry);
+                boolean unavailableSolidEntry = shouldSkipRarEntryWithUnavailableSolidContext(
+                        unavailableRar5SolidContext, header.isSolid());
+                String path = header.isDirectory() || header.getRedirection() != null
+                        ? null : safeEntryPath(header.getFileName());
+                boolean matches = path != null && matchesMode(path, mode);
+                progress.startEntry(header.getFileName(),
+                        missingContinuation || unavailableSolidEntry || !matches ? 0L : size, stats);
                 if (header.isDirectory() || header.getRedirection() != null) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
-                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
-                if (shouldSkipUnavailableRarContinuation(missingLeadingVolume, header.isSplitBefore(), rar5Entry)) {
+                if (missingContinuation) {
                     // Junrar rejects RAR5 split-before entries when an earlier volume is absent.
                     // Skip before opening a ZIP entry, so no empty or partial file is written.
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     unavailableRar5SolidContext = true;
                     continue;
                 }
-                if (shouldSkipRarEntryWithUnavailableSolidContext(unavailableRar5SolidContext, header.isSolid())) {
+                if (unavailableSolidEntry) {
                     // A later solid entry depends on the skipped entry's decoder state. Skip until
                     // a non-solid entry resets that state; otherwise extraction can fail CRC checks.
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 if (!header.isSolid()) unavailableRar5SolidContext = false;
-                String path = safeEntryPath(header.getFileName());
-                if (path == null || !matchesMode(path, mode)) {
+                if (path == null || !matches) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 if (files.contains(path) || directories.contains(path + "/")) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 addParentDirectories(path, output, directories, files);
                 files.add(path);
-                long size = header.getFullUnpackSize();
                 if (size < 0) throw new IOException("RAR girdisinin boyutu okunamadı: " + path);
                 ZipArchiveEntry entry = new ZipArchiveEntry(path);
                 entry.setSize(size);
                 output.putArchiveEntry(entry);
-                archive.extractFile(header, new CountingOutputStream(output, expanded));
+                archive.extractFile(header, new CountingOutputStream(output, expanded, progress, stats));
                 output.closeArchiveEntry();
                 stats.kept++;
+                progress.finishCurrent(stats);
             }
         } finally {
             archive.close();
@@ -459,7 +558,7 @@ final class ArchiveProcessor {
     }
 
     private static void filterSevenZ(List<File> volumes, int mode, ZipArchiveOutputStream output,
-                                     Stats stats) throws IOException {
+                                     Stats stats, ProgressTracker progress) throws IOException {
         SeekableByteChannel channel = null;
         SevenZFile sevenZ = null;
         try {
@@ -478,24 +577,38 @@ final class ArchiveProcessor {
             Set<String> directories = new HashSet<>();
             Set<String> files = new HashSet<>();
             long[] expanded = {0L};
+            long totalWork = 0L;
+            for (SevenZArchiveEntry metadata : sevenZ.getEntries()) {
+                progress.checkCancelled();
+                progress.inspectEntry(metadata.getName(), stats);
+                totalWork = addWork(totalWork, progressWorkSize(metadata.getName(), metadata.getSize(),
+                        metadata.isDirectory(), mode));
+            }
+            progress.setTotalWork(totalWork);
             SevenZArchiveEntry entry;
             while ((entry = sevenZ.getNextEntry()) != null) {
+                progress.checkCancelled();
                 stats.scanned++;
                 checkEntryLimit(stats.scanned);
+                long size = entry.isDirectory() ? 0L : entry.getSize();
+                String path = entry.isDirectory() ? null : safeEntryPath(entry.getName());
+                boolean matches = path != null && matchesMode(path, mode);
+                progress.startEntry(entry.getName(), matches ? size : 0L, stats);
                 if (entry.isDirectory()) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
-                String path = safeEntryPath(entry.getName());
-                if (path == null || !matchesMode(path, mode)) {
+                if (path == null || !matches) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
                 if (files.contains(path) || directories.contains(path + "/")) {
                     stats.skipped++;
+                    progress.skipCurrent(stats);
                     continue;
                 }
-                long size = entry.getSize();
                 if (size < 0) throw new IOException("7Z girdisinin boyutu okunamadı: " + path);
                 addParentDirectories(path, output, directories, files);
                 files.add(path);
@@ -503,9 +616,10 @@ final class ArchiveProcessor {
                 outEntry.setSize(size);
                 if (entry.getHasLastModifiedDate()) outEntry.setTime(entry.getLastModifiedDate().getTime());
                 output.putArchiveEntry(outEntry);
-                copySevenZEntry(sevenZ, output, expanded);
+                copySevenZEntry(sevenZ, output, expanded, progress, stats);
                 output.closeArchiveEntry();
                 stats.kept++;
+                progress.finishCurrent(stats);
             }
         } finally {
             if (sevenZ != null) sevenZ.close();
@@ -513,14 +627,19 @@ final class ArchiveProcessor {
         }
     }
 
-    private static void copySevenZEntry(SevenZFile sevenZ, OutputStream out, long[] expanded) throws IOException {
+    private static void copySevenZEntry(SevenZFile sevenZ, OutputStream out, long[] expanded,
+                                        ProgressTracker progress, Stats stats) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
         int read;
-        while ((read = sevenZ.read(buffer)) != -1) {
+        while (true) {
+            progress.checkCancelled();
+            read = sevenZ.read(buffer);
+            if (read == -1) break;
             if (read == 0) continue;
             ensureExpandedCapacity(expanded[0], read);
             out.write(buffer, 0, read);
             expanded[0] += read;
+            progress.advanceCurrent(read, stats);
         }
     }
 
@@ -587,14 +706,19 @@ final class ArchiveProcessor {
         }
     }
 
-    private static void copyLimited(InputStream in, OutputStream out, long[] expanded) throws IOException {
+    private static void copyLimited(InputStream in, OutputStream out, long[] expanded,
+                                    ProgressTracker progress, Stats stats) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
         int read;
-        while ((read = in.read(buffer)) != -1) {
+        while (true) {
+            progress.checkCancelled();
+            read = in.read(buffer);
+            if (read == -1) break;
             if (read == 0) continue;
             ensureExpandedCapacity(expanded[0], read);
             out.write(buffer, 0, read);
             expanded[0] += read;
+            progress.advanceCurrent(read, stats);
         }
     }
 
@@ -615,6 +739,101 @@ final class ArchiveProcessor {
         return slash >= 0 ? normalized.substring(slash + 1) : normalized;
     }
 
+    private static long progressWorkSize(String name, long size, boolean excluded, int mode) {
+        if (excluded) return 0L;
+        String path = safeEntryPath(name);
+        return path != null && matchesMode(path, mode) ? size : 0L;
+    }
+
+    private static long addWork(long current, long size) {
+        long weight = size > 0 ? size : 1L;
+        if (current > Long.MAX_VALUE - weight) return Long.MAX_VALUE;
+        return current + weight;
+    }
+
+    private static final class ProgressTracker {
+        private final ProgressListener listener;
+        private long totalWork = 1L;
+        private long completedWork;
+        private long currentWeight;
+        private long currentBytes;
+        private String currentEntry = "";
+
+        ProgressTracker(ProgressListener listener) { this.listener = listener; }
+
+        void checkCancelled() throws OperationCancelledException {
+            if (Thread.currentThread().isInterrupted() || listener.isCancelled()) {
+                throw new OperationCancelledException();
+            }
+        }
+
+        void setTotalWork(long value) {
+            totalWork = Math.max(1L, value);
+        }
+
+        void inspectEntry(String name, Stats stats) throws IOException {
+            checkCancelled();
+            currentEntry = name == null || name.trim().isEmpty() ? "(isimsiz girdi)" : name;
+            report("Arşiv başlıkları inceleniyor", stats);
+            currentEntry = "";
+        }
+
+        void startEntry(String name, long size, Stats stats) throws IOException {
+            checkCancelled();
+            currentEntry = name == null || name.trim().isEmpty() ? "(isimsiz girdi)" : name;
+            currentWeight = size > 0 ? size : 1L;
+            currentBytes = 0L;
+            report("Girdi taranıyor", stats);
+        }
+
+        void advanceCurrent(long amount, Stats stats) throws IOException {
+            checkCancelled();
+            if (amount <= 0) return;
+            long remaining = Math.max(0L, currentWeight - currentBytes);
+            currentBytes += Math.min(remaining, amount);
+            report("Dosya çıkarılıyor", stats);
+        }
+
+        void skipCurrent(Stats stats) throws IOException {
+            completeCurrent("Girdi atlandı", stats);
+        }
+
+        void finishCurrent(Stats stats) throws IOException {
+            completeCurrent("Dosya tamamlandı", stats);
+        }
+
+        private void completeCurrent(String phase, Stats stats) throws IOException {
+            checkCancelled();
+            if (completedWork > Long.MAX_VALUE - currentWeight) completedWork = Long.MAX_VALUE;
+            else completedWork += currentWeight;
+            currentWeight = 0L;
+            currentBytes = 0L;
+            report(phase, stats);
+            currentEntry = "";
+        }
+
+        void finish(Stats stats) throws IOException {
+            checkCancelled();
+            completedWork = totalWork;
+            currentWeight = 0L;
+            currentBytes = 0L;
+            report("Tamamlandı", stats);
+        }
+
+        private void report(String phase, Stats stats) {
+            long current = completedWork;
+            if (currentWeight > 0) {
+                long partial = Math.min(currentWeight, currentBytes);
+                current = current > Long.MAX_VALUE - partial ? Long.MAX_VALUE : current + partial;
+            }
+            int percent = totalWork <= 0 ? 0
+                    : current >= totalWork ? 100
+                    : (int) Math.max(0d, Math.min(100d, ((double) current / (double) totalWork) * 100d));
+            listener.onProgress(new Progress(percent, phase, currentEntry,
+                    stats.scanned, stats.kept, stats.skipped));
+        }
+    }
+
     private static final class NumberedName {
         final int number;
         final String name;
@@ -626,18 +845,29 @@ final class ArchiveProcessor {
     private static final class CountingOutputStream extends OutputStream {
         private final OutputStream target;
         private final long[] total;
-        CountingOutputStream(OutputStream target, long[] total) { this.target = target; this.total = total; }
+        private final ProgressTracker progress;
+        private final Stats stats;
+        CountingOutputStream(OutputStream target, long[] total, ProgressTracker progress, Stats stats) {
+            this.target = target;
+            this.total = total;
+            this.progress = progress;
+            this.stats = stats;
+        }
         @Override public void write(int value) throws IOException {
+            progress.checkCancelled();
             ensureExpandedCapacity(total[0], 1);
             target.write(value);
             total[0]++;
+            progress.advanceCurrent(1, stats);
         }
         @Override public void write(byte[] bytes, int offset, int length) throws IOException {
             if (bytes == null) throw new NullPointerException("bytes");
             if (offset < 0 || length < 0 || length > bytes.length - offset) throw new IndexOutOfBoundsException("Invalid buffer range");
+            progress.checkCancelled();
             ensureExpandedCapacity(total[0], length);
             target.write(bytes, offset, length);
             total[0] += length;
+            progress.advanceCurrent(length, stats);
         }
         @Override public void flush() throws IOException { target.flush(); }
         @Override public void close() throws IOException { flush(); }
