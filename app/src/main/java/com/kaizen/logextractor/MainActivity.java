@@ -58,6 +58,8 @@ public final class MainActivity extends Activity {
     private static final int COLOR_BORDER = Color.argb(82, 239, 239, 250);
     private static final int COLOR_BORDER_SELECTED = Color.argb(210, 202, 183, 255);
     private static final int COLOR_SUCCESS = Color.rgb(167, 224, 194);
+    private static final int COLOR_SUB = Color.argb(150, 15, 15, 19);
+    private static final int COLOR_SUB_SELECTED = Color.argb(235, 66, 56, 92);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<PickedArchive> selectedArchives = new ArrayList<>();
@@ -77,6 +79,9 @@ public final class MainActivity extends Activity {
     private TextView statsView;
     private LinearLayout defaultCard;
     private LinearLayout cardsCard;
+    private LinearLayout cardsSubPanel;
+    private TextView cardsDefaultOption;
+    private TextView cardsFormatOption;
     private TextView processButton;
     private TextView cancelButton;
     private TextView progressPercentView;
@@ -179,6 +184,20 @@ public final class MainActivity extends Activity {
         page.addView(modes, new LinearLayout.LayoutParams(-1, -2));
         defaultCard = modeCard("ALL FILES", "Dosyaları koru; boş klasörleri atla.");
         cardsCard = modeCard("CARD MATCH", "Adında card geçen dosyaları tut.");
+        // Sub-mode row: only shown while CARD MATCH is the active top-level mode.
+        cardsSubPanel = new LinearLayout(this);
+        cardsSubPanel.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams subParams = new LinearLayout.LayoutParams(-1, -2);
+        subParams.topMargin = dp(12);
+        cardsCard.addView(cardsSubPanel, subParams);
+        cardsDefaultOption = subOption("Default Cards");
+        cardsFormatOption = subOption("Format Cards");
+        cardsSubPanel.addView(cardsDefaultOption, new LinearLayout.LayoutParams(-1, -2));
+        LinearLayout.LayoutParams formatOptionParams = new LinearLayout.LayoutParams(-1, -2);
+        formatOptionParams.topMargin = dp(6);
+        cardsSubPanel.addView(cardsFormatOption, formatOptionParams);
+        cardsDefaultOption.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_CARDS));
+        cardsFormatOption.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_FORMAT_CARDS));
         LinearLayout.LayoutParams leftParams = new LinearLayout.LayoutParams(0, -2, 1f);
         leftParams.setMargins(0, 0, dp(6), 0);
         LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(0, -2, 1f);
@@ -286,24 +305,48 @@ public final class MainActivity extends Activity {
         return wrapper;
     }
 
+    private TextView subOption(String label) {
+        TextView option = text(label, 10, COLOR_MUTED, true);
+        option.setGravity(Gravity.CENTER);
+        option.setPadding(dp(6), dp(9), dp(6), dp(9));
+        option.setBackground(rounded(COLOR_SUB, COLOR_BORDER, 12, true));
+        option.setClickable(true);
+        option.setFocusable(true);
+        return option;
+    }
+
     private void chooseMode(int mode) {
         if (busy) return;
         selectedMode = mode;
         refreshModeCards();
-        statusView.setText(mode == ArchiveProcessor.MODE_DEFAULT
-                ? "Tüm güvenli dosyalar korunacak; boş klasör girdileri atlanacak."
-                : "Yalnızca dosya adında card geçen dosyalar korunacak.");
+        if (mode == ArchiveProcessor.MODE_DEFAULT) {
+            statusView.setText("Tüm güvenli dosyalar korunacak; boş klasör girdileri atlanacak.");
+        } else if (mode == ArchiveProcessor.MODE_FORMAT_CARDS) {
+            statusView.setText("Adında card geçen dosyalar okunacak; eksiksiz kartlar tek bir TXT dosyasına yazılacak.");
+        } else {
+            statusView.setText("Yalnızca dosya adında card geçen dosyalar korunacak.");
+        }
     }
 
     private void refreshModeCards() {
         if (defaultCard == null || cardsCard == null) return;
         boolean isDefault = selectedMode == ArchiveProcessor.MODE_DEFAULT;
+        boolean isFormat = selectedMode == ArchiveProcessor.MODE_FORMAT_CARDS;
         defaultCard.setBackground(rounded(isDefault ? COLOR_CARD_SELECTED : COLOR_CARD,
                 isDefault ? COLOR_BORDER_SELECTED : COLOR_BORDER, 19, true));
         cardsCard.setBackground(rounded(!isDefault ? COLOR_CARD_SELECTED : COLOR_CARD,
                 !isDefault ? COLOR_BORDER_SELECTED : COLOR_BORDER, 19, true));
         ((TextView) defaultCard.getChildAt(0)).setTextColor(isDefault ? COLOR_LAVENDER : COLOR_TEXT);
         ((TextView) cardsCard.getChildAt(0)).setTextColor(!isDefault ? COLOR_LAVENDER : COLOR_TEXT);
+        if (cardsSubPanel == null) return;
+        cardsSubPanel.setVisibility(isDefault ? View.GONE : View.VISIBLE);
+        boolean defaultCardsActive = !isDefault && !isFormat;
+        cardsDefaultOption.setBackground(rounded(defaultCardsActive ? COLOR_SUB_SELECTED : COLOR_SUB,
+                defaultCardsActive ? COLOR_BORDER_SELECTED : COLOR_BORDER, 12, true));
+        cardsDefaultOption.setTextColor(defaultCardsActive ? COLOR_LAVENDER : COLOR_MUTED);
+        cardsFormatOption.setBackground(rounded(isFormat ? COLOR_SUB_SELECTED : COLOR_SUB,
+                isFormat ? COLOR_BORDER_SELECTED : COLOR_BORDER, 12, true));
+        cardsFormatOption.setTextColor(isFormat ? COLOR_LAVENDER : COLOR_MUTED);
     }
 
     private void addSectionLabel(LinearLayout parent, String value) {
@@ -541,6 +584,17 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /** Strips the archive extension so the formatted TXT is named after the payload, not the container. */
+    private static String safeOutputBase(String name) {
+        String base = name == null ? "" : name.replace('\\', '/');
+        int slash = base.lastIndexOf('/');
+        if (slash >= 0) base = base.substring(slash + 1);
+        base = base.replaceAll("(?i)\\.(part\\d+\\.rar|r\\d{2,3}|z\\d{2,3}|7z\\.\\d{3,}|zip\\.\\d{3,}|zip|jar|rar|7z)$", "");
+        base = base.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (base.isEmpty() || base.equals(".") || base.equals("..")) base = "kaizen";
+        return base;
+    }
+
     private void startProcessing() {
         if (busy) return;
         if (selectedArchives.isEmpty()) {
@@ -643,18 +697,26 @@ public final class MainActivity extends Activity {
                 List<File> requiredFiles = new ArrayList<>();
                 for (File file : staged) if (needed.contains(file.getName().toLowerCase(Locale.ROOT))) requiredFiles.add(file);
                 if (requiredFiles.size() != resolved.size()) throw new IOException("Arşiv parçalarından biri seçilmedi veya okunamadı.");
-
                 DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
                 if (folder == null || !folder.canWrite() || !"Kaizen_LOGS".equalsIgnoreCase(folder.getName())
                         || !isExpectedOutputFolder(folderUri)) {
                     throw new IOException("Kaizen_LOGS klasörüne yazma izni yok. Klasörü yeniden seç.");
                 }
                 checkJobCancelled();
-                String modeName = mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
+                final boolean formatCards = mode == ArchiveProcessor.MODE_FORMAT_CARDS;
                 String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
-                String outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
-                outputFile = folder.createFile("application/zip", outputName);
-                if (outputFile == null) throw new IOException("Çıktı ZIP dosyası oluşturulamadı.");
+                final String outputName;
+                final String outputMime;
+                if (formatCards) {
+                    outputMime = "text/plain";
+                    outputName = safeOutputBase(picked.get(0).name) + "-KAIZEN-FORMATTEDCARDS-" + timestamp + ".txt";
+                } else {
+                    String modeName = mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
+                    outputMime = "application/zip";
+                    outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
+                }
+                outputFile = folder.createFile(outputMime, outputName);
+                if (outputFile == null) throw new IOException("Çıktı dosyası oluşturulamadı.");
                 ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
                     @Override public boolean isCancelled() {
                         return cancelRequested.get() || Thread.currentThread().isInterrupted();
@@ -679,9 +741,12 @@ public final class MainActivity extends Activity {
                 String savedPath = "/storage/emulated/0/Kaizen_LOGS/" + outputName;
                 runOnUiThread(() -> {
                     setBusy(false, "✦  İşlem tamamlandı\nÇıktı: " + savedPath);
-                    statsView.setText("Taranan: " + result.scannedEntries + "\nKorunan dosya: " + result.keptFiles
+                    String keptLabel = formatCards ? "Kart satırı" : "Korunan dosya";
+                    int keptValue = formatCards ? result.cardRows : result.keptFiles;
+                    String outputLabel = formatCards ? "TXT" : "ZIP64 uyumlu ZIP";
+                    statsView.setText("Taranan: " + result.scannedEntries + "\n" + keptLabel + ": " + keptValue
                             + "  ·  Atlanan: " + result.skippedEntries + "\nKaynak: " + result.archiveType
-                            + "  ·  Parça: " + result.sourceParts + "  ·  Çıktı: ZIP64 uyumlu ZIP");
+                            + "  ·  Parça: " + result.sourceParts + "  ·  Çıktı: " + outputLabel);
                     Toast.makeText(this, "İşlem tamamlandı: " + outputName, Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
@@ -692,7 +757,7 @@ public final class MainActivity extends Activity {
                 if (!outputCompleted && outputFile != null) {
                     incompleteOutputName = outputFile.getName();
                     if (incompleteOutputName == null || incompleteOutputName.trim().isEmpty()) {
-                        incompleteOutputName = "oluşturulan çıktı ZIP'i";
+                        incompleteOutputName = "oluşturulan çıktı dosyası";
                     }
                     incompleteOutputDeleted = outputFile.delete();
                     if (!incompleteOutputDeleted) {
@@ -732,7 +797,7 @@ public final class MainActivity extends Activity {
             } finally {
                 if (workDir != null) deleteRecursively(workDir);
             }
-        });
+            });
     }
 
     private void cancelProcessing() {
@@ -832,7 +897,7 @@ public final class MainActivity extends Activity {
                 byName.put(name.toLowerCase(Locale.ROOT), new SourceFile(archive.uri, name));
                 names.add(name);
             }
-        }
+            }
         List<String> volumeNames = ArchiveProcessor.selectVolumeNames(names, picked.get(0).name);
         List<SourceFile> result = new ArrayList<>();
         Set<String> added = new HashSet<>();

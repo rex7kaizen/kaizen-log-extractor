@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -36,9 +37,13 @@ import java.util.regex.Pattern;
 final class ArchiveProcessor {
     static final int MODE_DEFAULT = 0;
     static final int MODE_CARDS = 1;
+    /** Same file selection as MODE_CARDS, but matching files are parsed into one pipe-separated TXT. */
+    static final int MODE_FORMAT_CARDS = 2;
     static final long MAX_INPUT_BYTES = 64L * 1024L * 1024L * 1024L;
     static final long MAX_EXPANDED_BYTES = 64L * 1024L * 1024L * 1024L;
     private static final int MAX_ENTRIES = 100_000;
+    private static final int MAX_CARDS = 100_000;
+    private static final int MAX_LINE_CHARS = 64 * 1024;
     private static final int BUFFER_SIZE = 128 * 1024;
     private static final int SEVEN_Z_MEMORY_LIMIT_KIB = 128 * 1024;
 
@@ -47,6 +52,14 @@ final class ArchiveProcessor {
     private static final Pattern RAW_ZIP_PART = Pattern.compile("^(.*\\.zip)\\.(\\d{3,})$", Pattern.CASE_INSENSITIVE);
     private static final Pattern SPLIT_ZIP_DISK = Pattern.compile("^(.*)\\.z(\\d{2,3})$", Pattern.CASE_INSENSITIVE);
     private static final Pattern OLD_RAR_PART = Pattern.compile("^(.*)\\.r(\\d{2,3})$", Pattern.CASE_INSENSITIVE);
+
+    /** 16 digits, optionally grouped by space, hyphen, pipe or dot. */
+    private static final Pattern CARD_NUMBER = Pattern.compile(
+            "(?<!\\d)(\\d{4})[ \\-|.]?(\\d{4})[ \\-|.]?(\\d{4})[ \\-|.]?(\\d{4})(?!\\d)");
+    /** Month separator year. Year may be 2 or 4 digits; only the last two are kept. */
+    private static final Pattern CARD_EXPIRY = Pattern.compile("(?<!\\d)(\\d{1,2})[ /\\-|.](\\d{2,4})(?!\\d)");
+    /** Exactly three digits that are not part of a longer digit run. */
+    private static final Pattern CARD_CVV = Pattern.compile("(?<!\\d)(\\d{3})(?!\\d)");
 
     private ArchiveProcessor() { }
 
@@ -58,13 +71,15 @@ final class ArchiveProcessor {
         final int keptFiles;
         final int skippedEntries;
         final int sourceParts;
+        final int cardRows;
 
-        Result(String archiveType, int scannedEntries, int keptFiles, int skippedEntries, int sourceParts) {
+        Result(String archiveType, int scannedEntries, int keptFiles, int skippedEntries, int sourceParts, int cardRows) {
             this.archiveType = archiveType;
             this.scannedEntries = scannedEntries;
             this.keptFiles = keptFiles;
             this.skippedEntries = skippedEntries;
             this.sourceParts = sourceParts;
+            this.cardRows = cardRows;
         }
     }
 
@@ -138,6 +153,17 @@ final class ArchiveProcessor {
         @Override public void onProgress(Progress progress) { }
     };
 
+    /**
+     * Where kept entries are written. The ZIP sink recreates parent directories; the card sink
+     * parses payload bytes into pipe-separated rows, so it needs no directory entries at all.
+     */
+    private interface EntrySink {
+        void parentDirectories(String path, Set<String> directories, Set<String> files) throws IOException;
+        OutputStream beginEntry(String path, long size, long time) throws IOException;
+        /** Closes the entry. Returns true when the entry actually produced output. */
+        boolean endEntry() throws IOException;
+    }
+
     static Result filter(File input, String originalName, int mode, OutputStream destination) throws Exception {
         return filter(input, originalName, mode, destination, Collections.singletonList(input), null);
     }
@@ -151,7 +177,9 @@ final class ArchiveProcessor {
     /** Streaming filter with cooperative cancellation and byte-weighted entry progress. */
     static Result filter(File input, String originalName, int mode, OutputStream destination,
                          List<File> candidates, ProgressListener listener) throws Exception {
-        if (mode != MODE_DEFAULT && mode != MODE_CARDS) throw new IllegalArgumentException("Bilinmeyen filtre modu.");
+        if (mode != MODE_DEFAULT && mode != MODE_CARDS && mode != MODE_FORMAT_CARDS) {
+            throw new IllegalArgumentException("Bilinmeyen filtre modu.");
+        }
         if (destination == null) throw new IOException("Çıktı akışı açılamadı.");
         if (input == null || candidates == null || candidates.isEmpty()) throw new IOException("Arşiv parçaları bulunamadı.");
         ProgressTracker progress = new ProgressTracker(listener == null ? NO_PROGRESS : listener);
@@ -184,38 +212,51 @@ final class ArchiveProcessor {
         if (volumes.isEmpty()) throw new IOException("İşlenecek arşiv bulunamadı.");
         ArchiveType type = detectType(primaryVolume(volumes, baseName(originalName)), primaryName(volumes, baseName(originalName)));
         Stats stats = new Stats();
-        try (ZipArchiveOutputStream output = new ZipArchiveOutputStream(destination)) {
-            output.setUseZip64(Zip64Mode.AsNeeded);
-            try {
-                switch (type) {
-                    case ZIP:
-                    case JAR:
-                        filterZip(volumes, baseName(originalName), mode, output, stats, progress);
-                        break;
-                    case RAR:
-                        filterRar(volumes.get(0), mode, output, stats, hasMissingLeadingVolume(volumes), progress);
-                        break;
-                    case SEVEN_Z:
-                        filterSevenZ(volumes, mode, output, stats, progress);
-                        break;
-                    default:
-                        throw new IOException("Desteklenmeyen arşiv türü.");
-                }
-            } catch (Exception e) {
-                if (hasMissingLeadingVolume(volumes)) {
-                    throw new IOException("Seçilen parça(lar) tanındı ve taranmaya çalışıldı, ancak arşiv bu parçalardan tek başına okunamıyor. İçerik başlangıç parçasına veya önceki parçalara bağlı olabilir; varsa eksik önceki parçaları da seç. Ayrıntı: "
-                            + safeMessage(e), e);
-                }
-                throw e;
+        ZipArchiveOutputStream zipOutput = null;
+        CardTextSink cardSink = null;
+        EntrySink sink;
+        if (mode == MODE_FORMAT_CARDS) {
+            cardSink = new CardTextSink(destination);
+            sink = cardSink;
+        } else {
+            zipOutput = new ZipArchiveOutputStream(destination);
+            zipOutput.setUseZip64(Zip64Mode.AsNeeded);
+            sink = new ZipSink(zipOutput);
+        }
+        try {
+            switch (type) {
+                case ZIP:
+                case JAR:
+                    filterZip(volumes, baseName(originalName), mode, sink, stats, progress);
+                    break;
+                case RAR:
+                    filterRar(volumes.get(0), mode, sink, stats, hasMissingLeadingVolume(volumes), progress);
+                    break;
+                case SEVEN_Z:
+                    filterSevenZ(volumes, mode, sink, stats, progress);
+                    break;
+                default:
+                    throw new IOException("Desteklenmeyen arşiv türü.");
             }
+        } catch (Exception e) {
+            if (hasMissingLeadingVolume(volumes)) {
+                throw new IOException("Seçilen parça(lar) tanındı ve taranmaya çalışıldı, ancak arşiv bu parçalardan tek başına okunamıyor. İçerik başlangıç parçasına veya önceki parçalara bağlı olabilir; varsa eksik önceki parçaları da seç. Ayrıntı: "
+                        + safeMessage(e), e);
+            }
+            throw e;
+        } finally {
+            if (zipOutput != null) zipOutput.close();
         }
         if (stats.kept == 0) {
             throw new NoMatchesException(mode == MODE_CARDS
                     ? "Dosya adında 'card' bulunan bir dosya bulunamadı. Boş çıktı kaydedilmedi."
+                    : mode == MODE_FORMAT_CARDS
+                    ? "Adında 'card' geçen dosyalarda tam kart bilgisi (numara, ay/yıl, CVV) bulunamadı. Boş çıktı kaydedilmedi."
                     : "Arşivde korunabilecek bir dosya bulunamadı. Boş çıktı kaydedilmedi.");
         }
         progress.finish(stats);
-        return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, volumes.size());
+        int cardRows = cardSink == null ? 0 : cardSink.rows();
+        return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, volumes.size(), cardRows);
     }
 
     /** Determines the required volume names and rejects gaps before large files are staged. */
@@ -257,7 +298,7 @@ final class ArchiveProcessor {
                 result.add(finalName);
                 if (result.size() == 1) return Collections.singletonList(finalName);
                 return result;
-            }
+                }
         }
         match = OLD_RAR_PART.matcher(selected);
         if (match.matches() || lower.endsWith(".rar")) {
@@ -356,7 +397,6 @@ final class ArchiveProcessor {
         result.sort(Comparator.comparingInt(value -> value.number));
         return result;
     }
-
     private static List<String> namesFrom(List<NumberedName> values) {
         List<String> result = new ArrayList<>();
         for (NumberedName value : values) result.add(value.name);
@@ -384,7 +424,7 @@ final class ArchiveProcessor {
     }
 
     private static void filterZip(List<File> volumes, String originalName, int mode,
-                                  ZipArchiveOutputStream output, Stats stats, ProgressTracker progress) throws IOException {
+                                  EntrySink sink, Stats stats, ProgressTracker progress) throws IOException {
         SeekableByteChannel channel = null;
         ZipFile zip = null;
         try {
@@ -441,18 +481,13 @@ final class ArchiveProcessor {
                     continue;
                 }
                 if (size < 0) throw new IOException("Arşiv girdisinin boyutu okunamadı: " + path);
-                addParentDirectories(path, output, directories, files);
+                sink.parentDirectories(path, directories, files);
                 files.add(path);
-                ZipArchiveEntry outEntry = new ZipArchiveEntry(path);
-                outEntry.setSize(size);
-                if (entry.getTime() > 0) outEntry.setTime(entry.getTime());
-                output.putArchiveEntry(outEntry);
+                OutputStream entryOutput = sink.beginEntry(path, size, entry.getTime());
                 try (InputStream in = zip.getInputStream(entry)) {
-                    copyLimited(in, output, expanded, progress, stats);
+                    copyLimited(in, entryOutput, expanded, progress, stats);
                 }
-                output.closeArchiveEntry();
-                stats.kept++;
-                progress.finishCurrent(stats);
+                completeEntry(sink, stats, progress);
             }
         } finally {
             if (zip != null) zip.close();
@@ -460,9 +495,9 @@ final class ArchiveProcessor {
         }
     }
 
-    private static void filterRar(File primaryVolume, int mode, ZipArchiveOutputStream output,
+    private static void filterRar(File primaryVolume, int mode, EntrySink sink,
                                   Stats stats, boolean missingLeadingVolume, ProgressTracker progress) throws Exception {
-        Set<String> directories = new HashSet<>();
+                                      Set<String> directories = new HashSet<>();
         Set<String> files = new HashSet<>();
         long[] expanded = {0L};
         Archive archive = new Archive(primaryVolume);
@@ -541,23 +576,19 @@ final class ArchiveProcessor {
                     progress.skipCurrent(stats);
                     continue;
                 }
-                addParentDirectories(path, output, directories, files);
-                files.add(path);
                 if (size < 0) throw new IOException("RAR girdisinin boyutu okunamadı: " + path);
-                ZipArchiveEntry entry = new ZipArchiveEntry(path);
-                entry.setSize(size);
-                output.putArchiveEntry(entry);
-                archive.extractFile(header, new CountingOutputStream(output, expanded, progress, stats));
-                output.closeArchiveEntry();
-                stats.kept++;
-                progress.finishCurrent(stats);
+                sink.parentDirectories(path, directories, files);
+                files.add(path);
+                OutputStream entryOutput = sink.beginEntry(path, size, 0L);
+                archive.extractFile(header, new CountingOutputStream(entryOutput, expanded, progress, stats));
+                completeEntry(sink, stats, progress);
             }
         } finally {
             archive.close();
         }
     }
 
-    private static void filterSevenZ(List<File> volumes, int mode, ZipArchiveOutputStream output,
+    private static void filterSevenZ(List<File> volumes, int mode, EntrySink sink,
                                      Stats stats, ProgressTracker progress) throws IOException {
         SeekableByteChannel channel = null;
         SevenZFile sevenZ = null;
@@ -566,7 +597,7 @@ final class ArchiveProcessor {
             if (volumes.size() > 1) {
                 channel = MultiReadOnlySeekableByteChannel.forFiles(volumes.toArray(new File[0]));
                 builder = SevenZFile.builder().setSeekableByteChannel(channel);
-            } else {
+                } else {
                 builder = SevenZFile.builder().setFile(volumes.get(0));
             }
             // If an earlier 7z volume is absent, attempt Commons Compress' bounded
@@ -610,20 +641,27 @@ final class ArchiveProcessor {
                     continue;
                 }
                 if (size < 0) throw new IOException("7Z girdisinin boyutu okunamadı: " + path);
-                addParentDirectories(path, output, directories, files);
+                sink.parentDirectories(path, directories, files);
                 files.add(path);
-                ZipArchiveEntry outEntry = new ZipArchiveEntry(path);
-                outEntry.setSize(size);
-                if (entry.getHasLastModifiedDate()) outEntry.setTime(entry.getLastModifiedDate().getTime());
-                output.putArchiveEntry(outEntry);
-                copySevenZEntry(sevenZ, output, expanded, progress, stats);
-                output.closeArchiveEntry();
-                stats.kept++;
-                progress.finishCurrent(stats);
+                long time = entry.getHasLastModifiedDate() ? entry.getLastModifiedDate().getTime() : 0L;
+                OutputStream entryOutput = sink.beginEntry(path, size, time);
+                copySevenZEntry(sevenZ, entryOutput, expanded, progress, stats);
+                completeEntry(sink, stats, progress);
             }
         } finally {
             if (sevenZ != null) sevenZ.close();
             if (channel != null) channel.close();
+        }
+    }
+
+    /** Shared tail of every kept entry: a sink may report that the entry produced no output. */
+    private static void completeEntry(EntrySink sink, Stats stats, ProgressTracker progress) throws IOException {
+        if (sink.endEntry()) {
+            stats.kept++;
+            progress.finishCurrent(stats);
+        } else {
+            stats.skipped++;
+            progress.skipCurrent(stats);
         }
     }
 
@@ -659,7 +697,6 @@ final class ArchiveProcessor {
         return (h[0] & 0xFF) == 0x37 && (h[1] & 0xFF) == 0x7A && (h[2] & 0xFF) == 0xBC
                 && (h[3] & 0xFF) == 0xAF && (h[4] & 0xFF) == 0x27 && (h[5] & 0xFF) == 0x1C;
     }
-
     private static String safeEntryPath(String raw) {
         if (raw == null || raw.isEmpty() || raw.indexOf('\0') >= 0) return null;
         String normal = raw.replace('\\', '/');
@@ -684,11 +721,13 @@ final class ArchiveProcessor {
         if (mode == MODE_DEFAULT) return true;
         int slash = path.lastIndexOf('/');
         String baseName = slash >= 0 ? path.substring(slash + 1) : path;
+        // "card" also covers "cards", "CARD.txt" and "mycards_2024.txt". Entries that do not
+        // contain a complete card are dropped by the parser anyway.
         return baseName.toLowerCase(Locale.ROOT).contains("card");
     }
 
-    private static void addParentDirectories(String filePath, ZipArchiveOutputStream output,
-                                             Set<String> directories, Set<String> files) throws IOException {
+    private static void addParentDirectories(String filePath, EntrySink sink, Set<String> directories,
+                                             Set<String> files) throws IOException {
         String[] parts = filePath.split("/");
         StringBuilder current = new StringBuilder();
         for (int i = 0; i < parts.length - 1; i++) {
@@ -698,10 +737,8 @@ final class ArchiveProcessor {
             if (files.contains(path)) throw new IOException("Arşivde çakışan dosya/klasör yolu bulundu: " + path);
             String directory = path + "/";
             if (directories.add(directory)) {
-                ZipArchiveEntry entry = new ZipArchiveEntry(directory);
-                entry.setSize(0);
-                output.putArchiveEntry(entry);
-                output.closeArchiveEntry();
+                sink.beginEntry(directory, 0L, 0L);
+                sink.endEntry();
             }
         }
     }
@@ -749,6 +786,190 @@ final class ArchiveProcessor {
         long weight = size > 0 ? size : 1L;
         if (current > Long.MAX_VALUE - weight) return Long.MAX_VALUE;
         return current + weight;
+    }
+
+    private static final class ZipSink implements EntrySink {
+        private final ZipArchiveOutputStream output;
+
+        ZipSink(ZipArchiveOutputStream output) { this.output = output; }
+
+        @Override public void parentDirectories(String path, Set<String> directories, Set<String> files) throws IOException {
+            addParentDirectories(path, this, directories, files);
+        }
+        @Override public OutputStream beginEntry(String path, long size, long time) throws IOException {
+            ZipArchiveEntry entry = new ZipArchiveEntry(path);
+            entry.setSize(size);
+            if (time > 0L) entry.setTime(time);
+            output.putArchiveEntry(entry);
+            return output;
+        }
+
+        @Override public boolean endEntry() throws IOException {
+            output.closeArchiveEntry();
+            return true;
+        }
+    }
+
+    /**
+     * Parses entry payloads into "number|mm|yy|cvv" rows on a single text stream.
+     * The header is written lazily so an empty result never leaves a header-only file behind.
+     */
+    private static final class CardTextSink implements EntrySink {
+        private static final byte[] HEADER = "number|mm|yy|cvv\n".getBytes(StandardCharsets.US_ASCII);
+        private final OutputStream output;
+        private final Set<String> seen = new HashSet<>();
+        private CardExtractor current;
+        private boolean headerWritten;
+        private int rows;
+
+        CardTextSink(OutputStream output) { this.output = output; }
+
+        int rows() { return rows; }
+
+        /** The text output has no directory entries. */
+        @Override public void parentDirectories(String path, Set<String> directories, Set<String> files) { }
+
+        @Override public OutputStream beginEntry(String path, long size, long time) throws IOException {
+            if (!headerWritten) {
+                output.write(HEADER);
+                headerWritten = true;
+            }
+            CardExtractor extractor = new CardExtractor(output, seen);
+            current = extractor;
+            return extractor;
+        }
+
+        @Override public boolean endEntry() throws IOException {
+            CardExtractor extractor = current;
+            current = null;
+            if (extractor == null) return false;
+            extractor.finish();
+            rows += extractor.rows();
+            return extractor.rows() > 0;
+        }
+    }
+
+    /**
+     * Byte-level line splitter and card parser. Working on raw bytes keeps UTF-8, UTF-16 and
+     * ASCII files on one code path: NUL bytes are dropped (UTF-16 padding) and everything
+     * outside printable ASCII becomes a separator. Only digits and separators matter here.
+     */
+    private static final class CardExtractor extends OutputStream {
+        private final OutputStream output;
+        private final Set<String> seen;
+        private final StringBuilder line = new StringBuilder(256);
+        private final byte[] single = new byte[1];
+        private String number;
+        private String month;
+        private String year;
+        private String cvv;
+        private int rows;
+        private boolean limitReached;
+
+        CardExtractor(OutputStream output, Set<String> seen) {
+            this.output = output;
+            this.seen = seen;
+        }
+
+        int rows() { return rows; }
+
+        @Override public void write(int value) throws IOException {
+            single[0] = (byte) value;
+            write(single, 0, 1);
+        }
+
+        @Override public void write(byte[] buffer, int offset, int length) throws IOException {
+            if (buffer == null) throw new NullPointerException("buffer");
+            if (offset < 0 || length < 0 || length > buffer.length - offset) {
+                throw new IndexOutOfBoundsException("Invalid buffer range");
+            }
+            int end = offset + length;
+            for (int i = offset; i < end; i++) {
+                int value = buffer[i] & 0xFF;
+                if (value == '\n' || value == '\r') {
+                    flushLine();
+                    continue;
+                }
+                if (value == 0) continue;
+                line.append(value >= 0x20 && value <= 0x7E ? (char) value : ' ');
+                if (line.length() >= MAX_LINE_CHARS) flushLine();
+            }
+        }
+        @Override public void flush() throws IOException { output.flush(); }
+
+        void finish() throws IOException {
+            flushLine();
+            output.flush();
+        }
+
+        private void flushLine() throws IOException {
+            if (line.length() == 0) return;
+            String text = line.toString();
+            line.setLength(0);
+            parse(text);
+        }
+
+        private void parse(String text) throws IOException {
+            Matcher numberMatch = CARD_NUMBER.matcher(text);
+            if (numberMatch.find()) {
+                StringBuilder digits = new StringBuilder(16);
+                for (int group = 1; group <= 4; group++) digits.append(numberMatch.group(group));
+                number = digits.toString();
+                month = null;
+                year = null;
+                cvv = null;
+                text = blank(text, numberMatch.start(), numberMatch.end());
+            }
+            if (number == null) return;
+            if (month == null) {
+                Matcher expiry = CARD_EXPIRY.matcher(text);
+                if (expiry.find()) {
+                    month = expiry.group(1);
+                    String rawYear = expiry.group(2);
+                    year = rawYear.length() <= 2 ? rawYear : rawYear.substring(rawYear.length() - 2);
+                    text = blank(text, expiry.start(), expiry.end());
+                }
+            }
+            if (month != null && cvv == null) {
+                Matcher cvvMatch = CARD_CVV.matcher(text);
+                if (cvvMatch.find()) cvv = cvvMatch.group(1);
+            }
+            emitIfComplete();
+        }
+
+        private static String blank(String text, int start, int end) {
+            return text.substring(0, start) + " " + text.substring(end);
+        }
+
+        private void emitIfComplete() throws IOException {
+            if (number == null || month == null || year == null || cvv == null) return;
+            String paddedMonth = month.length() == 1 ? "0" + month : month;
+            int monthValue;
+            try {
+                monthValue = Integer.parseInt(paddedMonth);
+            } catch (NumberFormatException e) {
+                clear();
+                return;
+            }
+            if (monthValue < 1 || monthValue > 12 || year.length() != 2 || cvv.length() != 3) {
+                clear();
+                return;
+            }
+            String row = number + "|" + paddedMonth + "|" + year + "|" + cvv;
+            if (seen.add(row) && !limitReached) {
+                output.write((row + "\n").getBytes(StandardCharsets.US_ASCII));
+                rows++;
+                if (rows >= MAX_CARDS) limitReached = true;
+            }
+            clear();
+        }
+
+        private void clear() {
+            number = null;
+            month = null;
+            year = null;
+            cvv = null;
+        }
     }
 
     private static final class ProgressTracker {
