@@ -4,6 +4,7 @@ import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZOutputFile;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -20,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.Assert.assertEquals;
@@ -278,10 +280,9 @@ public class ArchiveProcessorTest {
                         + "4999999999999999|12|28|123\n");
         try {
             assertEquals("number|mm|yy|cvv\n"
-                            + "4242424242424242|12|28|128\n"
-                            + "5555555555554444|12|28|392\n"
-                            + "4111111111111111|01|31|007\n"
-                            + "4999999999999999|12|28|123\n",
+                            + "************4242|**|**|***\n"
+                            + "************4444|**|**|***\n"
+                            + "************1111|**|**|***\n"                            + "************9999|**|**|***\n",
                     formatCards(input));
         } finally { input.delete(); }
     }
@@ -291,7 +292,7 @@ public class ArchiveProcessorTest {
         File input = zipOf("cards_export.txt",
                 "Card: 4242424242424242\nExp: 12/28\nCVV: 128\n");
         try {
-            assertEquals("number|mm|yy|cvv\n4242424242424242|12|28|128\n", formatCards(input));
+            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
         } finally { input.delete(); }
     }
 
@@ -312,7 +313,7 @@ public class ArchiveProcessorTest {
         File input = zipOf("cards_a.txt", "4242424242424242|12|28|128\n",
                 "cards_b.txt", "4242424242424242|12|28|128\n");
         try {
-            assertEquals("number|mm|yy|cvv\n4242424242424242|12|28|128\n", formatCards(input));
+            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
         } finally { input.delete(); }
     }
 
@@ -332,8 +333,8 @@ public class ArchiveProcessorTest {
         File input = zipOf("cards.txt", "4242424242424242|12|28|128\r\n4242424242424242|01|29|321\r\n");
         try {
             assertEquals("number|mm|yy|cvv\n"
-                            + "4242424242424242|12|28|128\n"
-                            + "4242424242424242|01|29|321\n",
+                            + "************4242|**|**|***\n"
+                            + "************4242|**|**|***\n",
                     formatCards(input));
         } finally { input.delete(); }
     }
@@ -343,7 +344,7 @@ public class ArchiveProcessorTest {
         byte[] utf16 = "\uFEFF4242424242424242|12|28|128\r\n".getBytes(StandardCharsets.UTF_16LE);
         File input = zipOfBytes("cards.txt", utf16);
         try {
-            assertEquals("number|mm|yy|cvv\n4242424242424242|12|28|128\n", formatCards(input));
+            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
         } finally { input.delete(); }
     }
 
@@ -352,14 +353,25 @@ public class ArchiveProcessorTest {
         byte[] utf16 = "\uFEFF4242424242424242|12|28|128\n".getBytes(StandardCharsets.UTF_16BE);
         File input = zipOfBytes("cards.txt", utf16);
         try {
-            assertEquals("number|mm|yy|cvv\n4242424242424242|12|28|128\n", formatCards(input));
+            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
         } finally { input.delete(); }
     }
 
     private static String formatCards(File input) throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_FORMAT_CARDS, out);
-        return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(out.toByteArray()))) {
+            ZipEntry entry = zip.getNextEntry();
+            assertEquals("masked_cards.txt", entry == null ? null : entry.getName());
+            ByteArrayOutputStream report = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            int read;
+            while ((read = zip.read(buffer)) != -1) {
+                if (read > 0) report.write(buffer, 0, read);
+            }
+            assertEquals("Format Cards output must contain exactly one report file", null, zip.getNextEntry());
+            return new String(report.toByteArray(), StandardCharsets.UTF_8);
+        }
     }
 
     private static ArchiveProcessor.Result filterTo(File input, String name, int mode, File output) throws Exception {

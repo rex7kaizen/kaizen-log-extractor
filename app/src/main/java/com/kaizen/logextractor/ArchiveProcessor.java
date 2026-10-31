@@ -212,17 +212,10 @@ final class ArchiveProcessor {
         if (volumes.isEmpty()) throw new IOException("İşlenecek arşiv bulunamadı.");
         ArchiveType type = detectType(primaryVolume(volumes, baseName(originalName)), primaryName(volumes, baseName(originalName)));
         Stats stats = new Stats();
-        ZipArchiveOutputStream zipOutput = null;
-        CardTextSink cardSink = null;
-        EntrySink sink;
-        if (mode == MODE_FORMAT_CARDS) {
-            cardSink = new CardTextSink(destination);
-            sink = cardSink;
-        } else {
-            zipOutput = new ZipArchiveOutputStream(destination);
-            zipOutput.setUseZip64(Zip64Mode.AsNeeded);
-            sink = new ZipSink(zipOutput);
-        }
+        ZipArchiveOutputStream zipOutput = new ZipArchiveOutputStream(destination);
+        zipOutput.setUseZip64(Zip64Mode.AsNeeded);
+        CardTextSink cardSink = mode == MODE_FORMAT_CARDS ? new CardTextSink(zipOutput) : null;
+        EntrySink sink = cardSink == null ? new ZipSink(zipOutput) : cardSink;
         try (ZipArchiveOutputStream closeableOutput = zipOutput) {
             try {
                 switch (type) {
@@ -239,6 +232,7 @@ final class ArchiveProcessor {
                     default:
                         throw new IOException("Desteklenmeyen arşiv türü.");
                 }
+                if (cardSink != null) cardSink.finish();
             } catch (Exception e) {
                 if (e instanceof OperationCancelledException) {
                     throw e;
@@ -819,23 +813,24 @@ final class ArchiveProcessor {
      */
     private static final class CardTextSink implements EntrySink {
         private static final byte[] HEADER = "number|mm|yy|cvv\n".getBytes(StandardCharsets.US_ASCII);
-        private final OutputStream output;
+        private final ZipArchiveOutputStream output;
         private final Set<String> seen = new HashSet<>();
         private CardExtractor current;
-        private boolean headerWritten;
+        private boolean entryOpened;
         private int rows;
 
-        CardTextSink(OutputStream output) { this.output = output; }
+        CardTextSink(ZipArchiveOutputStream output) { this.output = output; }
 
         int rows() { return rows; }
 
-        /** The text output has no directory entries. */
+        /** The report is the only entry in Format Cards output; source paths are not copied. */
         @Override public void parentDirectories(String path, Set<String> directories, Set<String> files) { }
 
         @Override public OutputStream beginEntry(String path, long size, long time) throws IOException {
-            if (!headerWritten) {
+            if (!entryOpened) {
+                output.putArchiveEntry(new ZipArchiveEntry("masked_cards.txt"));
                 output.write(HEADER);
-                headerWritten = true;
+                entryOpened = true;
             }
             CardExtractor extractor = new CardExtractor(output, seen);
             current = extractor;
@@ -849,6 +844,13 @@ final class ArchiveProcessor {
             extractor.finish();
             rows += extractor.rows();
             return extractor.rows() > 0;
+        }
+
+        void finish() throws IOException {
+            if (entryOpened) {
+                output.closeArchiveEntry();
+                entryOpened = false;
+            }
         }
     }
 
@@ -958,13 +960,33 @@ final class ArchiveProcessor {
                 clear();
                 return;
             }
-            String row = number + "|" + paddedMonth + "|" + year + "|" + cvv;
-            if (seen.add(row) && !limitReached) {
+            // Keep only a one-way fingerprint for de-duplication; never write source values.
+            String fingerprint = fingerprint(number + "|" + paddedMonth + "|" + year + "|" + cvv);
+            String maskedNumber = "************" + number.substring(number.length() - 4);
+            String row = maskedNumber + "|**|**|***";
+            if (seen.add(fingerprint) && !limitReached) {
                 output.write((row + "\n").getBytes(StandardCharsets.US_ASCII));
                 rows++;
                 if (rows >= MAX_CARDS) limitReached = true;
             }
             clear();
+        }
+
+        private static String fingerprint(String value) {
+            try {
+                byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(value.getBytes(StandardCharsets.US_ASCII));
+                char[] hex = "0123456789abcdef".toCharArray();
+                char[] encoded = new char[digest.length * 2];
+                for (int i = 0; i < digest.length; i++) {
+                    int b = digest[i] & 0xff;
+                    encoded[i * 2] = hex[b >>> 4];
+                    encoded[i * 2 + 1] = hex[b & 0x0f];
+                }
+                return new String(encoded);
+            } catch (java.security.NoSuchAlgorithmException e) {
+                throw new IllegalStateException("SHA-256 is unavailable", e);
+            }
         }
 
         private void clear() {

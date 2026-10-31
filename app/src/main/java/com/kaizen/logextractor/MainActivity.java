@@ -322,7 +322,7 @@ public final class MainActivity extends Activity {
         if (mode == ArchiveProcessor.MODE_DEFAULT) {
             statusView.setText("Tüm güvenli dosyalar korunacak; boş klasör girdileri atlanacak.");
         } else if (mode == ArchiveProcessor.MODE_FORMAT_CARDS) {
-            statusView.setText("Adında card geçen dosyalar okunacak; eksiksiz kartlar tek bir TXT dosyasına yazılacak.");
+            statusView.setText("Adında card geçen dosyalar taranacak; yalnızca son 4 karakteri görünen kayıtlar masked_cards.txt içine yazılacak.");
         } else {
             statusView.setText("Yalnızca dosya adında card geçen dosyalar korunacak.");
         }
@@ -705,16 +705,10 @@ public final class MainActivity extends Activity {
                 checkJobCancelled();
                 final boolean formatCards = mode == ArchiveProcessor.MODE_FORMAT_CARDS;
                 String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
-                final String outputName;
-                final String outputMime;
-                if (formatCards) {
-                    outputMime = "text/plain";
-                    outputName = safeOutputBase(picked.get(0).name) + "-KAIZEN-FORMATTEDCARDS-" + timestamp + ".txt";
-                } else {
-                    String modeName = mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
-                    outputMime = "application/zip";
-                    outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
-                }
+                String modeName = mode == ArchiveProcessor.MODE_FORMAT_CARDS ? "FormatCards"
+                        : mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
+                final String outputMime = "application/zip";
+                final String outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
                 outputFile = folder.createFile(outputMime, outputName);
                 if (outputFile == null) throw new IOException("Çıktı dosyası oluşturulamadı.");
                 ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
@@ -741,9 +735,9 @@ public final class MainActivity extends Activity {
                 String savedPath = "/storage/emulated/0/Kaizen_LOGS/" + outputName;
                 runOnUiThread(() -> {
                     setBusy(false, "✦  İşlem tamamlandı\nÇıktı: " + savedPath);
-                    String keptLabel = formatCards ? "Kart satırı" : "Korunan dosya";
+                    String keptLabel = formatCards ? "Roleplay kart satırı" : "Korunan dosya";
                     int keptValue = formatCards ? result.cardRows : result.keptFiles;
-                    String outputLabel = formatCards ? "TXT" : "ZIP64 uyumlu ZIP";
+                    String outputLabel = formatCards ? "ZIP64 uyumlu ZIP (masked_cards.txt)" : "ZIP64 uyumlu ZIP";
                     statsView.setText("Taranan: " + result.scannedEntries + "\n" + keptLabel + ": " + keptValue
                             + "  ·  Atlanan: " + result.skippedEntries + "\nKaynak: " + result.archiveType
                             + "  ·  Parça: " + result.sourceParts + "  ·  Çıktı: " + outputLabel);
