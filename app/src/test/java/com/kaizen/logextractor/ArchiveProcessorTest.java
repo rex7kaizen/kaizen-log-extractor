@@ -282,7 +282,8 @@ public class ArchiveProcessorTest {
             assertEquals("number|mm|yy|cvv\n"
                             + "************4242|**|**|***\n"
                             + "************4444|**|**|***\n"
-                            + "************1111|**|**|***\n"                            + "************9999|**|**|***\n",
+                            + "************1111|**|**|***\n"
+                            + "************9999|**|**|***\n",
                     formatCards(input));
         } finally { input.delete(); }
     }
