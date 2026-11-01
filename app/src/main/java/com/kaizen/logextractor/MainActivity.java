@@ -27,6 +27,7 @@ import android.widget.Toast;
 import androidx.documentfile.provider.DocumentFile;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -47,6 +48,7 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_ARCHIVE = 101;
     private static final int REQUEST_OUTPUT_FOLDER = 102;
     private static final int REQUEST_PARTS_FOLDER = 103;
+    private static final int REQUEST_TELEGRAM_ARCHIVE = 104;
     private static final long MAX_INPUT_BYTES = ArchiveProcessor.MAX_INPUT_BYTES;
     private static final long DISK_RESERVE_BYTES = 32L * 1024L * 1024L;
 
@@ -71,6 +73,7 @@ public final class MainActivity extends Activity {
     private int selectedMode = ArchiveProcessor.MODE_DEFAULT;
     private boolean busy;
     private boolean resumeAfterPartsFolder;
+    private File pendingTelegramImport;
 
     private TextView archiveNameView;
     private TextView partsFolderView;
@@ -168,6 +171,7 @@ public final class MainActivity extends Activity {
         archiveNameView.setPadding(0, dp(11), 0, dp(12));
         sourceCard.addView(archiveNameView);
         addButton(sourceCard, "＋   Arşiv veya parçaları seç", true, this::pickArchive);
+        addButton(sourceCard, "✈   Telegram'dan arşiv seç", false, this::pickTelegramArchive);
         TextView partHelp = text("Bölünmüş arşivlerde tüm parçaları seçebilir veya parçaların bulunduğu klasörü gösterebilirsin.", 11, COLOR_MUTED, false);
         partHelp.setPadding(0, dp(11), 0, dp(11));
         sourceCard.addView(partHelp);
@@ -422,6 +426,19 @@ public final class MainActivity extends Activity {
     private int withAlpha(int color, int alpha) { return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color)); }
     private int dp(float value) { return (int) (value * getResources().getDisplayMetrics().density + 0.5f); }
 
+    private void pickTelegramArchive() {
+        if (busy) return;
+        startActivityForResult(new Intent(this, TelegramImportActivity.class), REQUEST_TELEGRAM_ARCHIVE);
+    }
+
+    private void deletePendingTelegramImport() {
+        File file = pendingTelegramImport;
+        pendingTelegramImport = null;
+        if (file != null && file.exists() && !file.delete()) {
+            Log.w(TAG, "Could not delete unused Telegram import: " + file.getAbsolutePath());
+        }
+    }
+
     private void pickArchive() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -453,6 +470,38 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_TELEGRAM_ARCHIVE) {
+            if (resultCode != RESULT_OK || data == null) return;
+            String path = data.getStringExtra(TelegramImportActivity.EXTRA_FILE_PATH);
+            String name = data.getStringExtra(TelegramImportActivity.EXTRA_FILE_NAME);
+            if (path == null || name == null || !TelegramArchiveRules.isSupportedArchiveName(name)) {
+                statusView.setText("Telegram içe aktarma sonucu geçersiz. Yeniden dene.");
+                return;
+            }
+            try {
+                File imported = new File(path).getCanonicalFile();
+                File importRoot = new File(getFilesDir(), "telegram-import").getCanonicalFile();
+                String rootPrefix = importRoot.getPath() + File.separator;
+                if (!imported.getPath().startsWith(rootPrefix) || !imported.isFile()
+                        || imported.length() <= 0L || imported.length() > MAX_INPUT_BYTES) {
+                    throw new IOException("Telegram dosyası uygulamanın özel içe aktarma klasöründe değil veya boyutu geçersiz.");
+                }
+                deletePendingTelegramImport();
+                pendingTelegramImport = imported;
+                selectedArchives.clear();
+                selectedArchives.add(new PickedArchive(Uri.fromFile(imported), safeLocalName(name)));
+                partsTreeUri = null;
+                archiveNameView.setText(name + "  ·  Telegram");
+                partsFolderView.setText("Parça klasörü: seçilmedi");
+                statusView.setText("Telegram arşivi seçildi. Mevcut yerel filtre modlarından birini seçip devam edebilirsin.");
+            } catch (Exception e) {
+                Log.e(TAG, "Telegram archive result rejected", e);
+                String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                statusView.setText("Telegram arşivi eklenemedi: " + detail);
+                Toast.makeText(this, "Telegram arşivi eklenemedi: " + detail, Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
         if (requestCode == REQUEST_ARCHIVE) {
             if (resultCode != RESULT_OK || data == null) return;
             List<Uri> uris = new ArrayList<>();
@@ -467,6 +516,7 @@ public final class MainActivity extends Activity {
                 statusView.setText("Dosya seçimi alınamadı. Tekrar dene.");
                 return;
             }
+            deletePendingTelegramImport();
             selectedArchives.clear();
             partsTreeUri = null;
             for (Uri uri : uris) {
@@ -615,6 +665,8 @@ public final class MainActivity extends Activity {
         final Uri folderUri = outputTreeUri;
         final Uri sourceFolderUri = partsTreeUri;
         final int mode = selectedMode;
+        final File telegramImportToDelete = pendingTelegramImport;
+        pendingTelegramImport = null;
         cancelRequested.set(false);
         lastProgressUpdateMs = 0L;
         lastProgressPercent = -1;
@@ -790,6 +842,10 @@ public final class MainActivity extends Activity {
                 }
             } finally {
                 if (workDir != null) deleteRecursively(workDir);
+                if (telegramImportToDelete != null && telegramImportToDelete.exists()
+                        && !telegramImportToDelete.delete()) {
+                    Log.w(TAG, "Could not delete processed Telegram import: " + telegramImportToDelete.getAbsolutePath());
+                }
             }
             });
     }
@@ -840,6 +896,12 @@ public final class MainActivity extends Activity {
     }
 
     private long querySize(Uri uri) {
+        if (uri != null && "file".equalsIgnoreCase(uri.getScheme())) {
+            String path = uri.getPath();
+            if (path == null) return -1L;
+            File file = new File(path);
+            return file.isFile() ? file.length() : -1L;
+        }
         try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 int index = cursor.getColumnIndex(OpenableColumns.SIZE);
@@ -915,7 +977,15 @@ public final class MainActivity extends Activity {
                                CopyProgress copyProgress) throws IOException {
         boolean completed = false;
         long total = 0L;
-        try (InputStream input = getContentResolver().openInputStream(uri);
+        InputStream openedInput;
+        if (uri != null && "file".equalsIgnoreCase(uri.getScheme())) {
+            String path = uri.getPath();
+            if (path == null) throw new IOException("Telegram dosya yolu okunamadı.");
+            openedInput = new FileInputStream(new File(path));
+        } else {
+            openedInput = getContentResolver().openInputStream(uri);
+        }
+        try (InputStream input = openedInput;
              OutputStream output = new FileOutputStream(destination)) {
             if (input == null) throw new IOException("Seçilen dosya okunamadı: " + destination.getName());
             byte[] buffer = new byte[128 * 1024];
@@ -1000,6 +1070,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         cancelRequested.set(true);
+        if (!busy) deletePendingTelegramImport();
         super.onDestroy();
         worker.shutdownNow();
     }

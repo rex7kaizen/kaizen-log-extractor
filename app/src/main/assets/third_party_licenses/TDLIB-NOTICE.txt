@@ -1,0 +1,29 @@
+lib-tdlib-android
+=================
+
+The pinned Android AAR packages the generated org.drinkless.tdlib Java API and
+prebuilt TDLib JNI/OpenSSL native libraries for arm64-v8a, armeabi-v7a, x86,
+and x86_64.
+
+Mirror repository commit:
+11850efeb5791d4fd386c0eeec1ebce4c5080435
+
+Dependency coordinate:
+com.github.capullo-tech:lib-tdlib-android:11850efeb5791d4fd386c0eeec1ebce4c5080435
+
+Redistribution provenance:
+https://github.com/TGX-Android/tdlib
+Pinned upstream commit: 63524bd14bebb9d7f9f04a1747675501ec41ea0a
+Mirror repository:
+https://github.com/capullo-tech/lib-tdlib-android
+
+TDLib (libtdjni.so, TdApi.java, Client.java) is copyright Aliaksei Levin,
+Arseny Smirnov and TDLib contributors and is licensed under the Boost Software
+License 1.0. See TDLIB-BOOST-LICENSE.txt and https://github.com/tdlib/td.
+
+OpenSSL (libsslx.so, libcryptox.so) is Copyright The OpenSSL Project Authors
+and licensed under Apache License 2.0 (OpenSSL 3.x). See
+OPENSSL-APACHE-2.0-LICENSE.txt and https://www.openssl.org/source/license.html.
+
+Android compatibility references androidx.annotation, licensed under Apache
+License 2.0.
