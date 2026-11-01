@@ -557,7 +557,7 @@ final class TelegramTdLibManager {
                 }
                 final String path = downloaded.local.path;
                 try {
-                    fileWorker.execute(() -> copyDownloadedFile(path, archive.name, requestListener));
+                    fileWorker.execute(() -> deliverDownloadedFile(path, archive.name, requestListener));
                 } catch (java.util.concurrent.RejectedExecutionException e) {
                     importingFile.set(false);
                     requestInProgress.set(false);
