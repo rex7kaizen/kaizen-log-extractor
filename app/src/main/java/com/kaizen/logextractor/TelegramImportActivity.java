@@ -72,7 +72,7 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
         page.addView(refreshButton, refreshParams);
         refreshButton.setVisibility(View.GONE);
 
-        logoutButton = button("Telegram oturumunu kapat", () -> new AlertDialog.Builder(this)
+        logoutButton = button("Telegram oturumunu kapat", v -> new AlertDialog.Builder(this)
                 .setTitle("Telegram oturumunu kapat?")
                 .setMessage("TDLib oturumu ve yerel oturum veritabanı silinir. İçe aktardığın arşiv dosyası korunur.")
                 .setNegativeButton("Vazgeç", null)
