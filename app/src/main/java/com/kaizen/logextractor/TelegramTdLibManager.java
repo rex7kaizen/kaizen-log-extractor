@@ -10,8 +10,6 @@ import org.drinkless.tdlib.Client;
 import org.drinkless.tdlib.TdApi;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -20,7 +18,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -33,9 +30,10 @@ import java.util.concurrent.atomic.AtomicLong;
 final class TelegramTdLibManager {
     private static final String TAG = "KaizenTelegram";
     private static final int MAX_CHATS = 50;
-    private static final int MAX_MESSAGES = 50;
+    private static final int MAX_MESSAGES = 100;
+    private static final int MAX_ARCHIVES = 5;
+    private static final int MAX_HISTORY_MESSAGES_TO_SCAN = 5_000;
     private static final long MAX_DOWNLOAD_BYTES = ArchiveProcessor.MAX_INPUT_BYTES;
-    private static final long DISK_RESERVE_BYTES = 32L * 1024L * 1024L;
     private static final long DOWNLOAD_TIMEOUT_HOURS = 12L;
     private static volatile TelegramTdLibManager instance;
 
@@ -69,13 +67,15 @@ final class TelegramTdLibManager {
         final long messageId;
         final int fileId;
         final long size;
+        final int date;
         final String name;
 
-        ArchiveItem(long chatId, long messageId, int fileId, long size, String name) {
+        ArchiveItem(long chatId, long messageId, int fileId, long size, int date, String name) {
             this.chatId = chatId;
             this.messageId = messageId;
             this.fileId = fileId;
             this.size = size;
+            this.date = date;
             this.name = name;
         }
     }
@@ -411,43 +411,72 @@ final class TelegramTdLibManager {
             emitStatus("Başka bir Telegram isteği devam ediyor…");
             return;
         }
-        emitStatus("Seçilen sohbetin son " + MAX_MESSAGES + " mesajı taranıyor…");
+        emitStatus("Sohbet geçmişinde en yeni " + MAX_ARCHIVES + " arşiv aranıyor…");
+        fetchArchivePage(active, chat, 0L, 0, new ArrayList<>(), new HashSet<>());
+    }
+
+    private void fetchArchivePage(Client active, ChatItem chat, long fromMessageId, int scannedMessages,
+                                  List<ArchiveItem> archives, Set<Integer> seenFileIds) {
+        int remaining = MAX_HISTORY_MESSAGES_TO_SCAN - scannedMessages;
+        if (archives.size() >= MAX_ARCHIVES || remaining <= 0) {
+            finishArchiveScan(chat, archives);
+            return;
+        }
+        int pageLimit = Math.min(MAX_MESSAGES, remaining);
         try {
-            active.send(new TdApi.GetChatHistory(chat.id, 0L, 0, MAX_MESSAGES, false), object -> {
-                requestInProgress.set(false);
-                if (reportIfError(object, "Sohbet geçmişi alınamadı.")) return;
+            active.send(new TdApi.GetChatHistory(chat.id, fromMessageId, 0, pageLimit, false), object -> {
+                if (reportIfError(object, "Sohbet geçmişi alınamadı.")) {
+                    requestInProgress.set(false);
+                    return;
+                }
                 if (!(object instanceof TdApi.Messages)) {
+                    requestInProgress.set(false);
                     emitError("TDLib mesaj listesi yerine beklenmeyen bir yanıt döndürdü.");
                     return;
                 }
                 TdApi.Message[] messages = ((TdApi.Messages) object).messages;
-                List<ArchiveItem> archives = new ArrayList<>();
-                Set<Integer> seenFileIds = new HashSet<>();
-                if (messages != null) {
-                    for (TdApi.Message message : messages) {
-                        if (message == null || !(message.content instanceof TdApi.MessageDocument)) continue;
-                        TdApi.Document document = ((TdApi.MessageDocument) message.content).document;
-                        if (document == null || document.document == null || document.document.id <= 0) continue;
-                        String name = document.fileName;
-                        if (!TelegramArchiveRules.isSingleArchiveName(name)) continue;
-                        TdApi.File file = document.document;
-                        if (file.size > MAX_DOWNLOAD_BYTES) continue;
-                        if (!seenFileIds.add(file.id)) continue;
-                        try {
-                            archives.add(new ArchiveItem(chat.id, message.id, file.id,
-                                    Math.max(0L, file.size), TelegramArchiveRules.sanitizeFileName(name)));
-                        } catch (IllegalArgumentException e) {
-                            Log.w(TAG, "Skipping Telegram document with unsafe name", e);
-                        }
+                if (messages == null || messages.length == 0) {
+                    finishArchiveScan(chat, archives);
+                    return;
+                }
+                for (TdApi.Message message : messages) {
+                    if (message == null || !(message.content instanceof TdApi.MessageDocument)) continue;
+                    TdApi.Document document = ((TdApi.MessageDocument) message.content).document;
+                    if (document == null || document.document == null || document.document.id <= 0) continue;
+                    String name = document.fileName;
+                    if (!TelegramArchiveRules.isSingleArchiveName(name)) continue;
+                    TdApi.File file = document.document;
+                    if (file.size > MAX_DOWNLOAD_BYTES || !seenFileIds.add(file.id)) continue;
+                    try {
+                        archives.add(new ArchiveItem(chat.id, message.id, file.id,
+                                Math.max(0L, file.size), message.date, TelegramArchiveRules.sanitizeFileName(name)));
+                    } catch (IllegalArgumentException e) {
+                        Log.w(TAG, "Skipping Telegram document with unsafe name", e);
                     }
                 }
-                post(l -> l.onArchivesLoaded(chat, archives));
+                int nextScanned = scannedMessages + messages.length;
+                long oldestMessageId = messages[messages.length - 1].id;
+                if (archives.size() >= MAX_ARCHIVES || messages.length < pageLimit
+                        || nextScanned >= MAX_HISTORY_MESSAGES_TO_SCAN || oldestMessageId <= 0L
+                        || oldestMessageId == fromMessageId) {
+                    finishArchiveScan(chat, archives);
+                } else {
+                    fetchArchivePage(active, chat, oldestMessageId, nextScanned, archives, seenFileIds);
+                }
             });
         } catch (RuntimeException e) {
             requestInProgress.set(false);
-            Log.e(TAG, "GetChatHistory request failed", e);
+            Log.e(TAG, "GetChatHistory page request failed", e);
             emitError("Mesaj isteği gönderilemedi: " + readableMessage(e));
         }
+    }
+
+    private void finishArchiveScan(ChatItem chat, List<ArchiveItem> archives) {
+        requestInProgress.set(false);
+        archives.sort((left, right) -> Integer.compare(right.date, left.date));
+        List<ArchiveItem> latestArchives = new ArrayList<>(archives.subList(0,
+                Math.min(MAX_ARCHIVES, archives.size())));
+        post(l -> l.onArchivesLoaded(chat, latestArchives));
     }
 
     void downloadArchive(ArchiveItem archive) {
@@ -548,9 +577,12 @@ final class TelegramTdLibManager {
         }
     }
 
-    private void copyDownloadedFile(String sourcePath, String originalName, Listener expectedListener) {
-        File destination = null;
-        boolean completed = false;
+    /**
+     * Delivers TDLib's already-downloaded private file directly to the importer.
+     * No second full-size copy is created. TDLib DownloadFile itself still writes
+     * the original download to the app-private tdlib/files directory.
+     */
+    private void deliverDownloadedFile(String sourcePath, String originalName, Listener expectedListener) {
         boolean callbackPosted = false;
         try {
             if (expectedListener == null || listener != expectedListener || importCancellationRequested.get()) {
@@ -558,8 +590,8 @@ final class TelegramTdLibManager {
             }
             File source = new File(sourcePath).getCanonicalFile();
             File tdlibFilesRoot = new File(context.getFilesDir(), "tdlib/files").getCanonicalFile();
-            String tdlibFilesPrefix = tdlibFilesRoot.getPath() + File.separator;
-            if (!source.getPath().startsWith(tdlibFilesPrefix)) {
+            String rootPrefix = tdlibFilesRoot.getPath() + File.separator;
+            if (!source.getPath().startsWith(rootPrefix)) {
                 throw new IOException("TDLib indirme yolu uygulamanın özel dosya klasörünün dışında.");
             }
             if (!source.isFile() || !source.canRead()) throw new IOException("TDLib indirme dosyası okunamıyor.");
@@ -567,62 +599,25 @@ final class TelegramTdLibManager {
             if (sourceLength <= 0L) throw new IOException("Telegram'dan indirilen dosya boş.");
             if (sourceLength > MAX_DOWNLOAD_BYTES) throw new IOException("İndirilen dosya 64 GiB sınırını aşıyor.");
 
-            File directory = new File(context.getFilesDir(), "telegram-import");
-            if (!directory.exists() && !directory.mkdirs() && !directory.isDirectory()) {
-                throw new IOException("Telegram içe aktarma klasörü oluşturulamadı.");
-            }
-            if (directory.getUsableSpace() < sourceLength + DISK_RESERVE_BYTES) {
-                throw new IOException("İçe aktarma için yeterli boş depolama alanı yok.");
-            }
+            File imported = source;
             String safeName = TelegramArchiveRules.sanitizeFileName(originalName);
-            destination = new File(directory, UUID.randomUUID().toString() + "-" + safeName);
-            long copied = 0L;
-            try (FileInputStream input = new FileInputStream(source);
-                 FileOutputStream output = new FileOutputStream(destination)) {
-                byte[] buffer = new byte[128 * 1024];
-                int read;
-                while ((read = input.read(buffer)) != -1) {
-                    if (importCancellationRequested.get() || listener != expectedListener) {
-                        throw new IOException("Telegram ekranı kapatıldığı için içe aktarma iptal edildi.");
-                    }
-                    if (read == 0) continue;
-                    if (copied > MAX_DOWNLOAD_BYTES - read) {
-                        throw new IOException("İndirilen dosya 64 GiB sınırını aşıyor.");
-                    }
-                    output.write(buffer, 0, read);
-                    copied += read;
-                }
-                output.flush();
-                output.getFD().sync();
-            }
-            if (copied != sourceLength || copied <= 0L) {
-                throw new IOException("İçe aktarılan dosyanın boyutu kaynak dosyayla eşleşmiyor.");
-            }
-            File imported = destination;
             callbackPosted = mainHandler.post(() -> {
+                importingFile.set(false);
+                requestInProgress.set(false);
                 try {
                     if (listener == expectedListener && expectedListener != null) {
                         expectedListener.onArchiveImported(imported, safeName);
-                    } else if (imported.exists() && !imported.delete()) {
-                        Log.w(TAG, "Unused Telegram import could not be deleted: " + imported.getAbsolutePath());
                     }
                 } catch (RuntimeException callbackError) {
                     Log.e(TAG, "Telegram import result callback failed", callbackError);
                     emitError("İçe aktarılan arşiv ekrana aktarılamadı: " + readableMessage(callbackError));
-                } finally {
-                    importingFile.set(false);
-                    requestInProgress.set(false);
                 }
             });
             if (!callbackPosted) throw new IOException("Telegram içe aktarma sonucu uygulama ekranına iletilemedi.");
-            completed = true;
         } catch (Exception e) {
-            Log.e(TAG, "Telegram archive import failed", e);
+            Log.e(TAG, "Telegram archive delivery failed", e);
             emitError("Telegram arşivi içe aktarılamadı: " + readableMessage(e));
         } finally {
-            if (!completed && destination != null && destination.exists() && !destination.delete()) {
-                Log.w(TAG, "Partial Telegram import could not be deleted: " + destination.getAbsolutePath());
-            }
             if (!callbackPosted) {
                 importingFile.set(false);
                 requestInProgress.set(false);

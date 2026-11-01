@@ -18,7 +18,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.channels.SeekableByteChannel;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -36,14 +35,9 @@ import java.util.regex.Pattern;
 /** Streaming, path-safe archive filtering. Archive data is never loaded fully into memory. */
 final class ArchiveProcessor {
     static final int MODE_DEFAULT = 0;
-    static final int MODE_CARDS = 1;
-    /** Same file selection as MODE_CARDS, but matching files are parsed into one pipe-separated TXT. */
-    static final int MODE_FORMAT_CARDS = 2;
     static final long MAX_INPUT_BYTES = 64L * 1024L * 1024L * 1024L;
     static final long MAX_EXPANDED_BYTES = 64L * 1024L * 1024L * 1024L;
     private static final int MAX_ENTRIES = 100_000;
-    private static final int MAX_CARDS = 100_000;
-    private static final int MAX_LINE_CHARS = 64 * 1024;
     private static final int BUFFER_SIZE = 128 * 1024;
     private static final int SEVEN_Z_MEMORY_LIMIT_KIB = 128 * 1024;
 
@@ -53,13 +47,6 @@ final class ArchiveProcessor {
     private static final Pattern SPLIT_ZIP_DISK = Pattern.compile("^(.*)\\.z(\\d{2,3})$", Pattern.CASE_INSENSITIVE);
     private static final Pattern OLD_RAR_PART = Pattern.compile("^(.*)\\.r(\\d{2,3})$", Pattern.CASE_INSENSITIVE);
 
-    /** 16 digits, optionally grouped by space, hyphen, pipe or dot. */
-    private static final Pattern CARD_NUMBER = Pattern.compile(
-            "(?<!\\d)(\\d{4})[ \\-|.]?(\\d{4})[ \\-|.]?(\\d{4})[ \\-|.]?(\\d{4})(?!\\d)");
-    /** Month separator year. Year may be 2 or 4 digits; only the last two are kept. */
-    private static final Pattern CARD_EXPIRY = Pattern.compile("(?<!\\d)(\\d{1,2})[ /\\-|.](\\d{2,4})(?!\\d)");
-    /** Exactly three digits that are not part of a longer digit run. */
-    private static final Pattern CARD_CVV = Pattern.compile("(?<!\\d)(\\d{3})(?!\\d)");
 
     private ArchiveProcessor() { }
 
@@ -71,15 +58,13 @@ final class ArchiveProcessor {
         final int keptFiles;
         final int skippedEntries;
         final int sourceParts;
-        final int cardRows;
 
-        Result(String archiveType, int scannedEntries, int keptFiles, int skippedEntries, int sourceParts, int cardRows) {
+        Result(String archiveType, int scannedEntries, int keptFiles, int skippedEntries, int sourceParts) {
             this.archiveType = archiveType;
             this.scannedEntries = scannedEntries;
             this.keptFiles = keptFiles;
             this.skippedEntries = skippedEntries;
             this.sourceParts = sourceParts;
-            this.cardRows = cardRows;
         }
     }
 
@@ -177,7 +162,7 @@ final class ArchiveProcessor {
     /** Streaming filter with cooperative cancellation and byte-weighted entry progress. */
     static Result filter(File input, String originalName, int mode, OutputStream destination,
                          List<File> candidates, ProgressListener listener) throws Exception {
-        if (mode != MODE_DEFAULT && mode != MODE_CARDS && mode != MODE_FORMAT_CARDS) {
+        if (mode != MODE_DEFAULT) {
             throw new IllegalArgumentException("Bilinmeyen filtre modu.");
         }
         if (destination == null) throw new IOException("Çıktı akışı açılamadı.");
@@ -214,8 +199,7 @@ final class ArchiveProcessor {
         Stats stats = new Stats();
         ZipArchiveOutputStream zipOutput = new ZipArchiveOutputStream(destination);
         zipOutput.setUseZip64(Zip64Mode.AsNeeded);
-        CardTextSink cardSink = mode == MODE_FORMAT_CARDS ? new CardTextSink(zipOutput) : null;
-        EntrySink sink = cardSink == null ? new ZipSink(zipOutput) : cardSink;
+        EntrySink sink = new ZipSink(zipOutput);
         try (ZipArchiveOutputStream closeableOutput = zipOutput) {
             try {
                 switch (type) {
@@ -232,7 +216,6 @@ final class ArchiveProcessor {
                     default:
                         throw new IOException("Desteklenmeyen arşiv türü.");
                 }
-                if (cardSink != null) cardSink.finish();
             } catch (Exception e) {
                 if (e instanceof OperationCancelledException) {
                     throw e;
@@ -245,15 +228,10 @@ final class ArchiveProcessor {
             }
         }
         if (stats.kept == 0) {
-            throw new NoMatchesException(mode == MODE_CARDS
-                    ? "Dosya adında 'card' bulunan bir dosya bulunamadı. Boş çıktı kaydedilmedi."
-                    : mode == MODE_FORMAT_CARDS
-                    ? "Adında 'card' geçen dosyalarda tam kart bilgisi (numara, ay/yıl, CVV) bulunamadı. Boş çıktı kaydedilmedi."
-                    : "Arşivde korunabilecek bir dosya bulunamadı. Boş çıktı kaydedilmedi.");
+            throw new NoMatchesException("Arşivde korunabilecek bir dosya bulunamadı. Boş çıktı kaydedilmedi.");
         }
         progress.finish(stats);
-        int cardRows = cardSink == null ? 0 : cardSink.rows();
-        return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, volumes.size(), cardRows);
+        return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, volumes.size());
     }
 
     /** Determines the required volume names and rejects gaps before large files are staged. */
@@ -715,12 +693,7 @@ final class ArchiveProcessor {
     }
 
     private static boolean matchesMode(String path, int mode) {
-        if (mode == MODE_DEFAULT) return true;
-        int slash = path.lastIndexOf('/');
-        String baseName = slash >= 0 ? path.substring(slash + 1) : path;
-        // "card" also covers "cards", "CARD.txt" and "mycards_2024.txt". Entries that do not
-        // contain a complete card are dropped by the parser anyway.
-        return baseName.toLowerCase(Locale.ROOT).contains("card");
+        return mode == MODE_DEFAULT && path != null;
     }
 
     private static void addParentDirectories(String filePath, EntrySink sink, Set<String> directories,
@@ -804,196 +777,6 @@ final class ArchiveProcessor {
         @Override public boolean endEntry() throws IOException {
             output.closeArchiveEntry();
             return true;
-        }
-    }
-
-    /**
-     * Parses entry payloads into "number|mm|yy|cvv" rows on a single text stream.
-     * The header is written lazily so an empty result never leaves a header-only file behind.
-     */
-    private static final class CardTextSink implements EntrySink {
-        private static final byte[] HEADER = "number|mm|yy|cvv\n".getBytes(StandardCharsets.US_ASCII);
-        private final ZipArchiveOutputStream output;
-        private final Set<String> seen = new HashSet<>();
-        private CardExtractor current;
-        private boolean entryOpened;
-        private int rows;
-
-        CardTextSink(ZipArchiveOutputStream output) { this.output = output; }
-
-        int rows() { return rows; }
-
-        /** The report is the only entry in Format Cards output; source paths are not copied. */
-        @Override public void parentDirectories(String path, Set<String> directories, Set<String> files) { }
-
-        @Override public OutputStream beginEntry(String path, long size, long time) throws IOException {
-            if (!entryOpened) {
-                output.putArchiveEntry(new ZipArchiveEntry("masked_cards.txt"));
-                output.write(HEADER);
-                entryOpened = true;
-            }
-            CardExtractor extractor = new CardExtractor(output, seen);
-            current = extractor;
-            return extractor;
-        }
-
-        @Override public boolean endEntry() throws IOException {
-            CardExtractor extractor = current;
-            current = null;
-            if (extractor == null) return false;
-            extractor.finish();
-            rows += extractor.rows();
-            return extractor.rows() > 0;
-        }
-
-        void finish() throws IOException {
-            if (entryOpened) {
-                output.closeArchiveEntry();
-                entryOpened = false;
-            }
-        }
-    }
-
-    /**
-     * Byte-level line splitter and card parser. Working on raw bytes keeps UTF-8, UTF-16 and
-     * ASCII files on one code path: NUL bytes are dropped (UTF-16 padding) and everything
-     * outside printable ASCII becomes a separator. Only digits and separators matter here.
-     */
-    private static final class CardExtractor extends OutputStream {
-        private final OutputStream output;
-        private final Set<String> seen;
-        private final StringBuilder line = new StringBuilder(256);
-        private final byte[] single = new byte[1];
-        private String number;
-        private String month;
-        private String year;
-        private String cvv;
-        private int rows;
-        private boolean limitReached;
-
-        CardExtractor(OutputStream output, Set<String> seen) {
-            this.output = output;
-            this.seen = seen;
-        }
-
-        int rows() { return rows; }
-
-        @Override public void write(int value) throws IOException {
-            single[0] = (byte) value;
-            write(single, 0, 1);
-        }
-
-        @Override public void write(byte[] buffer, int offset, int length) throws IOException {
-            if (buffer == null) throw new NullPointerException("buffer");
-            if (offset < 0 || length < 0 || length > buffer.length - offset) {
-                throw new IndexOutOfBoundsException("Invalid buffer range");
-            }
-            int end = offset + length;
-            for (int i = offset; i < end; i++) {
-                int value = buffer[i] & 0xFF;
-                if (value == '\n' || value == '\r') {
-                    flushLine();
-                    continue;
-                }
-                if (value == 0) continue;
-                line.append(value >= 0x20 && value <= 0x7E ? (char) value : ' ');
-                if (line.length() >= MAX_LINE_CHARS) flushLine();
-            }
-        }
-        @Override public void flush() throws IOException { output.flush(); }
-
-        void finish() throws IOException {
-            flushLine();
-            output.flush();
-        }
-
-        private void flushLine() throws IOException {
-            if (line.length() == 0) return;
-            String text = line.toString();
-            line.setLength(0);
-            parse(text);
-        }
-
-        private void parse(String text) throws IOException {
-            Matcher numberMatch = CARD_NUMBER.matcher(text);
-            if (numberMatch.find()) {
-                StringBuilder digits = new StringBuilder(16);
-                for (int group = 1; group <= 4; group++) digits.append(numberMatch.group(group));
-                number = digits.toString();
-                month = null;
-                year = null;
-                cvv = null;
-                text = blank(text, numberMatch.start(), numberMatch.end());
-            }
-            if (number == null) return;
-            if (month == null) {
-                Matcher expiry = CARD_EXPIRY.matcher(text);
-                if (expiry.find()) {
-                    month = expiry.group(1);
-                    String rawYear = expiry.group(2);
-                    year = rawYear.length() <= 2 ? rawYear : rawYear.substring(rawYear.length() - 2);
-                    text = blank(text, expiry.start(), expiry.end());
-                }
-            }
-            if (month != null && cvv == null) {
-                Matcher cvvMatch = CARD_CVV.matcher(text);
-                if (cvvMatch.find()) cvv = cvvMatch.group(1);
-            }
-            emitIfComplete();
-        }
-
-        private static String blank(String text, int start, int end) {
-            return text.substring(0, start) + " " + text.substring(end);
-        }
-
-        private void emitIfComplete() throws IOException {
-            if (number == null || month == null || year == null || cvv == null) return;
-            String paddedMonth = month.length() == 1 ? "0" + month : month;
-            int monthValue;
-            try {
-                monthValue = Integer.parseInt(paddedMonth);
-            } catch (NumberFormatException e) {
-                clear();
-                return;
-            }
-            if (monthValue < 1 || monthValue > 12 || year.length() != 2 || cvv.length() != 3) {
-                clear();
-                return;
-            }
-            // Keep only a one-way fingerprint for de-duplication; never write source values.
-            String fingerprint = fingerprint(number + "|" + paddedMonth + "|" + year + "|" + cvv);
-            String maskedNumber = "************" + number.substring(number.length() - 4);
-            String row = maskedNumber + "|**|**|***";
-            if (seen.add(fingerprint) && !limitReached) {
-                output.write((row + "\n").getBytes(StandardCharsets.US_ASCII));
-                rows++;
-                if (rows >= MAX_CARDS) limitReached = true;
-            }
-            clear();
-        }
-
-        private static String fingerprint(String value) {
-            try {
-                byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
-                        .digest(value.getBytes(StandardCharsets.US_ASCII));
-                char[] hex = "0123456789abcdef".toCharArray();
-                char[] encoded = new char[digest.length * 2];
-                for (int i = 0; i < digest.length; i++) {
-                    int b = digest[i] & 0xff;
-                    encoded[i * 2] = hex[b >>> 4];
-                    encoded[i * 2 + 1] = hex[b & 0x0f];
-                }
-                return new String(encoded);
-            } catch (java.security.NoSuchAlgorithmException e) {
-                throw new IllegalStateException("SHA-256 is unavailable", e);
-            }
-        }
-
-        private void clear() {
-            number = null;
-            month = null;
-            year = null;
-            cvv = null;
         }
     }
 

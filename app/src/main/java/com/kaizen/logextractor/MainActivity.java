@@ -60,8 +60,6 @@ public final class MainActivity extends Activity {
     private static final int COLOR_BORDER = Color.argb(82, 239, 239, 250);
     private static final int COLOR_BORDER_SELECTED = Color.argb(210, 202, 183, 255);
     private static final int COLOR_SUCCESS = Color.rgb(167, 224, 194);
-    private static final int COLOR_SUB = Color.argb(150, 15, 15, 19);
-    private static final int COLOR_SUB_SELECTED = Color.argb(235, 66, 56, 92);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<PickedArchive> selectedArchives = new ArrayList<>();
@@ -70,21 +68,15 @@ public final class MainActivity extends Activity {
     private int lastProgressPercent = -1;
     private Uri outputTreeUri;
     private Uri partsTreeUri;
-    private int selectedMode = ArchiveProcessor.MODE_DEFAULT;
     private boolean busy;
     private boolean resumeAfterPartsFolder;
-    private File pendingTelegramImport;
+    private boolean selectedFromTelegram;
 
     private TextView archiveNameView;
     private TextView partsFolderView;
     private TextView outputFolderView;
     private TextView statusView;
     private TextView statsView;
-    private LinearLayout defaultCard;
-    private LinearLayout cardsCard;
-    private LinearLayout cardsSubPanel;
-    private TextView cardsDefaultOption;
-    private TextView cardsFormatOption;
     private TextView processButton;
     private TextView cancelButton;
     private TextView progressPercentView;
@@ -181,35 +173,12 @@ public final class MainActivity extends Activity {
         sourceCard.addView(partsFolderView);
         addSpace(page, 14);
 
-        addSectionLabel(page, "02  /  FILTER MODE");
+        addSectionLabel(page, "02  /  ARCHIVE MODE");
         addSpace(page, 9);
-        LinearLayout modes = new LinearLayout(this);
-        modes.setOrientation(LinearLayout.HORIZONTAL);
-        page.addView(modes, new LinearLayout.LayoutParams(-1, -2));
-        defaultCard = modeCard("ALL FILES", "Dosyaları koru; boş klasörleri atla.");
-        cardsCard = modeCard("CARD MATCH", "Adında card geçen dosyaları tut.");
-        // Sub-mode row: only shown while CARD MATCH is the active top-level mode.
-        cardsSubPanel = new LinearLayout(this);
-        cardsSubPanel.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams subParams = new LinearLayout.LayoutParams(-1, -2);
-        subParams.topMargin = dp(12);
-        cardsCard.addView(cardsSubPanel, subParams);
-        cardsDefaultOption = subOption("Default Cards");
-        cardsFormatOption = subOption("Format Cards");
-        cardsSubPanel.addView(cardsDefaultOption, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout.LayoutParams formatOptionParams = new LinearLayout.LayoutParams(-1, -2);
-        formatOptionParams.topMargin = dp(6);
-        cardsSubPanel.addView(cardsFormatOption, formatOptionParams);
-        cardsDefaultOption.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_CARDS));
-        cardsFormatOption.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_FORMAT_CARDS));
-        LinearLayout.LayoutParams leftParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        leftParams.setMargins(0, 0, dp(6), 0);
-        LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        rightParams.setMargins(dp(6), 0, 0, 0);
-        modes.addView(defaultCard, leftParams);
-        modes.addView(cardsCard, rightParams);
-        defaultCard.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_DEFAULT));
-        cardsCard.setOnClickListener(v -> chooseMode(ArchiveProcessor.MODE_CARDS));
+        LinearLayout archiveModeCard = modeCard("ALL FILES", "Arşivlerdeki normal dosyaları koru; boş klasörleri atla.");
+        archiveModeCard.setBackground(rounded(COLOR_CARD_SELECTED, COLOR_BORDER_SELECTED, 19, true));
+        ((TextView) archiveModeCard.getChildAt(0)).setTextColor(COLOR_LAVENDER);
+        page.addView(archiveModeCard, new LinearLayout.LayoutParams(-1, -2));
         addSpace(page, 14);
 
         LinearLayout outputCard = panel(page, false);
@@ -278,7 +247,6 @@ public final class MainActivity extends Activity {
         footer.setLetterSpacing(0.13f);
         page.addView(footer);
         setContentView(scroll);
-        refreshModeCards();
     }
 
     private LinearLayout panel(LinearLayout parent, boolean hero) {
@@ -307,50 +275,6 @@ public final class MainActivity extends Activity {
         wrapper.setClickable(true);
         wrapper.setFocusable(true);
         return wrapper;
-    }
-
-    private TextView subOption(String label) {
-        TextView option = text(label, 10, COLOR_MUTED, true);
-        option.setGravity(Gravity.CENTER);
-        option.setPadding(dp(6), dp(9), dp(6), dp(9));
-        option.setBackground(rounded(COLOR_SUB, COLOR_BORDER, 12, true));
-        option.setClickable(true);
-        option.setFocusable(true);
-        return option;
-    }
-
-    private void chooseMode(int mode) {
-        if (busy) return;
-        selectedMode = mode;
-        refreshModeCards();
-        if (mode == ArchiveProcessor.MODE_DEFAULT) {
-            statusView.setText("Tüm güvenli dosyalar korunacak; boş klasör girdileri atlanacak.");
-        } else if (mode == ArchiveProcessor.MODE_FORMAT_CARDS) {
-            statusView.setText("Adında card geçen dosyalar taranacak; yalnızca son 4 karakteri görünen kayıtlar masked_cards.txt içine yazılacak.");
-        } else {
-            statusView.setText("Yalnızca dosya adında card geçen dosyalar korunacak.");
-        }
-    }
-
-    private void refreshModeCards() {
-        if (defaultCard == null || cardsCard == null) return;
-        boolean isDefault = selectedMode == ArchiveProcessor.MODE_DEFAULT;
-        boolean isFormat = selectedMode == ArchiveProcessor.MODE_FORMAT_CARDS;
-        defaultCard.setBackground(rounded(isDefault ? COLOR_CARD_SELECTED : COLOR_CARD,
-                isDefault ? COLOR_BORDER_SELECTED : COLOR_BORDER, 19, true));
-        cardsCard.setBackground(rounded(!isDefault ? COLOR_CARD_SELECTED : COLOR_CARD,
-                !isDefault ? COLOR_BORDER_SELECTED : COLOR_BORDER, 19, true));
-        ((TextView) defaultCard.getChildAt(0)).setTextColor(isDefault ? COLOR_LAVENDER : COLOR_TEXT);
-        ((TextView) cardsCard.getChildAt(0)).setTextColor(!isDefault ? COLOR_LAVENDER : COLOR_TEXT);
-        if (cardsSubPanel == null) return;
-        cardsSubPanel.setVisibility(isDefault ? View.GONE : View.VISIBLE);
-        boolean defaultCardsActive = !isDefault && !isFormat;
-        cardsDefaultOption.setBackground(rounded(defaultCardsActive ? COLOR_SUB_SELECTED : COLOR_SUB,
-                defaultCardsActive ? COLOR_BORDER_SELECTED : COLOR_BORDER, 12, true));
-        cardsDefaultOption.setTextColor(defaultCardsActive ? COLOR_LAVENDER : COLOR_MUTED);
-        cardsFormatOption.setBackground(rounded(isFormat ? COLOR_SUB_SELECTED : COLOR_SUB,
-                isFormat ? COLOR_BORDER_SELECTED : COLOR_BORDER, 12, true));
-        cardsFormatOption.setTextColor(isFormat ? COLOR_LAVENDER : COLOR_MUTED);
     }
 
     private void addSectionLabel(LinearLayout parent, String value) {
@@ -431,14 +355,6 @@ public final class MainActivity extends Activity {
         startActivityForResult(new Intent(this, TelegramImportActivity.class), REQUEST_TELEGRAM_ARCHIVE);
     }
 
-    private void deletePendingTelegramImport() {
-        File file = pendingTelegramImport;
-        pendingTelegramImport = null;
-        if (file != null && file.exists() && !file.delete()) {
-            Log.w(TAG, "Could not delete unused Telegram import: " + file.getAbsolutePath());
-        }
-    }
-
     private void pickArchive() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -472,33 +388,42 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_TELEGRAM_ARCHIVE) {
             if (resultCode != RESULT_OK || data == null) return;
-            String path = data.getStringExtra(TelegramImportActivity.EXTRA_FILE_PATH);
-            String name = data.getStringExtra(TelegramImportActivity.EXTRA_FILE_NAME);
-            if (path == null || name == null || !TelegramArchiveRules.isSupportedArchiveName(name)) {
+            ArrayList<String> paths = data.getStringArrayListExtra(TelegramImportActivity.EXTRA_FILE_PATHS);
+            ArrayList<String> names = data.getStringArrayListExtra(TelegramImportActivity.EXTRA_FILE_NAMES);
+            if (paths == null || names == null || paths.isEmpty() || paths.size() > 5 || paths.size() != names.size()) {
                 statusView.setText("Telegram içe aktarma sonucu geçersiz. Yeniden dene.");
                 return;
             }
             try {
-                File imported = new File(path).getCanonicalFile();
-                File importRoot = new File(getFilesDir(), "telegram-import").getCanonicalFile();
-                String rootPrefix = importRoot.getPath() + File.separator;
-                if (!imported.getPath().startsWith(rootPrefix) || !imported.isFile()
-                        || imported.length() <= 0L || imported.length() > MAX_INPUT_BYTES) {
-                    throw new IOException("Telegram dosyası uygulamanın özel içe aktarma klasöründe değil veya boyutu geçersiz.");
+                File tdlibRoot = new File(getFilesDir(), "tdlib/files").getCanonicalFile();
+                String rootPrefix = tdlibRoot.getPath() + File.separator;
+                List<PickedArchive> imported = new ArrayList<>();
+                for (int i = 0; i < paths.size(); i++) {
+                    String name = names.get(i);
+                    if (!TelegramArchiveRules.isSupportedArchiveName(name)) {
+                        throw new IOException("Telegram arşiv adı geçersiz: " + name);
+                    }
+                    File file = new File(paths.get(i)).getCanonicalFile();
+                    if (!file.getPath().startsWith(rootPrefix) || !file.isFile()
+                            || file.length() <= 0L || file.length() > MAX_INPUT_BYTES) {
+                        throw new IOException("Telegram dosyası TDLib'in özel indirme klasöründe değil veya boyutu geçersiz.");
+                    }
+                    imported.add(new PickedArchive(Uri.fromFile(file), safeLocalName(name)));
                 }
-                deletePendingTelegramImport();
-                pendingTelegramImport = imported;
                 selectedArchives.clear();
-                selectedArchives.add(new PickedArchive(Uri.fromFile(imported), safeLocalName(name)));
+                selectedArchives.addAll(imported);
+                selectedFromTelegram = true;
                 partsTreeUri = null;
-                archiveNameView.setText(name + "  ·  Telegram");
+                PickedArchive first = imported.get(0);
+                archiveNameView.setText(imported.size() == 1 ? first.name
+                        : first.name + "  +  " + (imported.size() - 1) + " arşiv");
                 partsFolderView.setText("Parça klasörü: seçilmedi");
-                statusView.setText("Telegram arşivi seçildi. Mevcut yerel filtre modlarından birini seçip devam edebilirsin.");
+                statusView.setText(imported.size() + " Telegram arşivi seçildi. Her biri ayrı ZIP çıktısı olarak işlenecek.");
             } catch (Exception e) {
                 Log.e(TAG, "Telegram archive result rejected", e);
                 String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-                statusView.setText("Telegram arşivi eklenemedi: " + detail);
-                Toast.makeText(this, "Telegram arşivi eklenemedi: " + detail, Toast.LENGTH_LONG).show();
+                statusView.setText("Telegram arşivleri eklenemedi: " + detail);
+                Toast.makeText(this, "Telegram arşivleri eklenemedi: " + detail, Toast.LENGTH_LONG).show();
             }
             return;
         }
@@ -516,7 +441,7 @@ public final class MainActivity extends Activity {
                 statusView.setText("Dosya seçimi alınamadı. Tekrar dene.");
                 return;
             }
-            deletePendingTelegramImport();
+            selectedFromTelegram = false;
             selectedArchives.clear();
             partsTreeUri = null;
             for (Uri uri : uris) {
@@ -634,7 +559,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    /** Strips the archive extension so the formatted TXT is named after the payload, not the container. */
+    /** Produces a safe base name for a generic archive output. */
     private static String safeOutputBase(String name) {
         String base = name == null ? "" : name.replace('\\', '/');
         int slash = base.lastIndexOf('/');
@@ -643,6 +568,81 @@ public final class MainActivity extends Activity {
         base = base.replaceAll("[^A-Za-z0-9._-]", "_");
         if (base.isEmpty() || base.equals(".") || base.equals("..")) base = "kaizen";
         return base;
+    }
+
+    private String processTelegramArchiveBatch(List<PickedArchive> picked, Uri folderUri) throws Exception {
+        DocumentFile folder = DocumentFile.fromTreeUri(this, folderUri);
+        if (folder == null || !folder.canWrite() || !"Kaizen_LOGS".equalsIgnoreCase(folder.getName())
+                || !isExpectedOutputFolder(folderUri)) {
+            throw new IOException("Kaizen_LOGS klasörüne yazma izni yok. Klasörü yeniden seç.");
+        }
+        File tdlibRoot = new File(getFilesDir(), "tdlib/files").getCanonicalFile();
+        String rootPrefix = tdlibRoot.getPath() + File.separator;
+        String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
+        int totalScanned = 0;
+        int totalKept = 0;
+        int totalSkipped = 0;
+        StringBuilder report = new StringBuilder("Telegram arşivleri ayrı ayrı işlendi: ").append(picked.size());
+        for (int i = 0; i < picked.size(); i++) {
+            checkJobCancelled();
+            PickedArchive item = picked.get(i);
+            if (item.uri == null || !"file".equalsIgnoreCase(item.uri.getScheme())) {
+                throw new IOException("Telegram arşiv yolu geçersiz: " + item.name);
+            }
+            File source = new File(item.uri.getPath()).getCanonicalFile();
+            if (!source.getPath().startsWith(rootPrefix) || !source.isFile() || !source.canRead()) {
+                throw new IOException("Telegram arşivi TDLib'in özel dosya klasöründe bulunamadı: " + item.name);
+            }
+            if (source.length() <= 0L || source.length() > MAX_INPUT_BYTES) {
+                throw new IOException("Telegram arşiv boyutu geçersiz: " + item.name);
+            }
+            String outputName = "Kaizen_LOG_EXTRACTOR_Telegram_" + timestamp + "_" + (i + 1)
+                    + "_" + safeOutputBase(item.name) + ".zip";
+            DocumentFile outputFile = folder.createFile("application/zip", outputName);
+            if (outputFile == null) throw new IOException("Çıktı dosyası oluşturulamadı: " + outputName);
+            boolean completed = false;
+            try {
+                final int archiveIndex = i;
+                final int archiveCount = picked.size();
+                ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
+                    @Override public boolean isCancelled() {
+                        return cancelRequested.get() || Thread.currentThread().isInterrupted();
+                    }
+                    @Override public void onProgress(ArchiveProcessor.Progress progress) {
+                        int overall = (int) (((long) archiveIndex * 100L + progress.percent) / archiveCount);
+                        postProgress(overall, "Telegram arşivi işleniyor " + (archiveIndex + 1) + "/" + archiveCount,
+                                item.name + " · " + progress.currentEntry, progress.scannedEntries,
+                                progress.keptFiles, progress.skippedEntries);
+                    }
+                };
+                ArchiveProcessor.Result result;
+                try (OutputStream output = getContentResolver().openOutputStream(outputFile.getUri(), "w")) {
+                    if (output == null) throw new IOException("Çıktı dosyası yazma için açılamadı: " + outputName);
+                    checkJobCancelled();
+                    result = ArchiveProcessor.filter(source, item.name, ArchiveProcessor.MODE_DEFAULT,
+                            output, java.util.Collections.singletonList(source), listener);
+                    checkJobCancelled();
+                }
+                completed = true;
+                totalScanned += result.scannedEntries;
+                totalKept += result.keptFiles;
+                totalSkipped += result.skippedEntries;
+                report.append("\n").append(i + 1).append(". ").append(item.name)
+                        .append(" — korunan: ").append(result.keptFiles)
+                        .append(", atlanan: ").append(result.skippedEntries)
+                        .append(", tür: ").append(result.archiveType);
+            } finally {
+                if (!completed && outputFile.exists() && !outputFile.delete()) {
+                    Log.w(TAG, "Incomplete Telegram output could not be deleted: " + outputName);
+                }
+            }
+        }
+        report.append("\nToplam taranan: ").append(totalScanned)
+                .append(" · korunan: ").append(totalKept)
+                .append(" · atlanan: ").append(totalSkipped);
+        postProgress(100, "Tamamlandı", picked.size() + " Telegram arşivi işlendi",
+                totalScanned, totalKept, totalSkipped);
+        return report.toString();
     }
 
     private void startProcessing() {
@@ -664,9 +664,9 @@ public final class MainActivity extends Activity {
         final List<PickedArchive> picked = new ArrayList<>(selectedArchives);
         final Uri folderUri = outputTreeUri;
         final Uri sourceFolderUri = partsTreeUri;
-        final int mode = selectedMode;
-        final File telegramImportToDelete = pendingTelegramImport;
-        pendingTelegramImport = null;
+        final int mode = ArchiveProcessor.MODE_DEFAULT;
+        final boolean processTelegramBatch = selectedFromTelegram;
+        selectedFromTelegram = false;
         cancelRequested.set(false);
         lastProgressUpdateMs = 0L;
         lastProgressPercent = -1;
@@ -680,6 +680,15 @@ public final class MainActivity extends Activity {
                 checkJobCancelled();
                 workDir = new File(getCacheDir(), "kaizen-job-" + System.nanoTime());
                 if (!workDir.mkdirs() && !workDir.isDirectory()) throw new IOException("Geçici çalışma klasörü oluşturulamadı.");
+                if (processTelegramBatch) {
+                    String batchReport = processTelegramArchiveBatch(picked, folderUri);
+                    runOnUiThread(() -> {
+                        setBusy(false, "✦  Telegram arşivleri tamamlandı");
+                        statsView.setText(batchReport);
+                        Toast.makeText(this, picked.size() + " Telegram arşivi işlendi.", Toast.LENGTH_LONG).show();
+                    });
+                    return;
+                }
                 List<SourceFile> sources = resolveSources(picked, sourceFolderUri);
                 if (sources.isEmpty()) throw new IOException("Arşiv dosyası veya gerekli parçalar bulunamadı.");
 
@@ -755,10 +764,8 @@ public final class MainActivity extends Activity {
                     throw new IOException("Kaizen_LOGS klasörüne yazma izni yok. Klasörü yeniden seç.");
                 }
                 checkJobCancelled();
-                final boolean formatCards = mode == ArchiveProcessor.MODE_FORMAT_CARDS;
                 String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
-                String modeName = mode == ArchiveProcessor.MODE_FORMAT_CARDS ? "FormatCards"
-                        : mode == ArchiveProcessor.MODE_CARDS ? "Cards" : "Default";
+                String modeName = "Default";
                 final String outputMime = "application/zip";
                 final String outputName = "Kaizen_LOG_EXTRACTOR_" + modeName + "_" + timestamp + ".zip";
                 outputFile = folder.createFile(outputMime, outputName);
@@ -787,12 +794,9 @@ public final class MainActivity extends Activity {
                 String savedPath = "/storage/emulated/0/Kaizen_LOGS/" + outputName;
                 runOnUiThread(() -> {
                     setBusy(false, "✦  İşlem tamamlandı\nÇıktı: " + savedPath);
-                    String keptLabel = formatCards ? "Roleplay kart satırı" : "Korunan dosya";
-                    int keptValue = formatCards ? result.cardRows : result.keptFiles;
-                    String outputLabel = formatCards ? "ZIP64 uyumlu ZIP (masked_cards.txt)" : "ZIP64 uyumlu ZIP";
-                    statsView.setText("Taranan: " + result.scannedEntries + "\n" + keptLabel + ": " + keptValue
+                    statsView.setText("Taranan: " + result.scannedEntries + "\nKorunan dosya: " + result.keptFiles
                             + "  ·  Atlanan: " + result.skippedEntries + "\nKaynak: " + result.archiveType
-                            + "  ·  Parça: " + result.sourceParts + "  ·  Çıktı: " + outputLabel);
+                            + "  ·  Parça: " + result.sourceParts + "  ·  Çıktı: ZIP64 uyumlu ZIP");
                     Toast.makeText(this, "İşlem tamamlandı: " + outputName, Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
@@ -842,10 +846,6 @@ public final class MainActivity extends Activity {
                 }
             } finally {
                 if (workDir != null) deleteRecursively(workDir);
-                if (telegramImportToDelete != null && telegramImportToDelete.exists()
-                        && !telegramImportToDelete.delete()) {
-                    Log.w(TAG, "Could not delete processed Telegram import: " + telegramImportToDelete.getAbsolutePath());
-                }
             }
             });
     }
@@ -1070,7 +1070,6 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         cancelRequested.set(true);
-        if (!busy) deletePendingTelegramImport();
         super.onDestroy();
         worker.shutdownNow();
     }

@@ -48,24 +48,6 @@ public class ArchiveProcessorTest {
     }
 
     @Test
-    public void cardsMatchesBasenameCaseInsensitivelyNotParentFolder() throws Exception {
-        File input = zipOf("kaizen/card/fix.txt", "folder has card only",
-                "kaizen/hahah/xdxd/xd.txt", "ordinary",
-                "kaizen/hahah/xdxd/cardxdxd.txt", "card",
-                "kaizen/hahah/xfjsifh/cards.txt", "cards",
-                "CARD.txt", "upper case");
-        File output = File.createTempFile("kaizen-cards", ".zip");
-        try {
-            ArchiveProcessor.Result result = filterTo(input, "sample.zip", ArchiveProcessor.MODE_CARDS, output);
-            assertEquals(3, result.keptFiles);
-            assertEquals(new TreeSet<>(Arrays.asList(
-                    "kaizen/", "kaizen/hahah/", "kaizen/hahah/xdxd/",
-                    "kaizen/hahah/xdxd/cardxdxd.txt", "kaizen/hahah/xfjsifh/",
-                    "kaizen/hahah/xfjsifh/cards.txt", "CARD.txt")), entryNames(output));
-        } finally { input.delete(); output.delete(); }
-    }
-
-    @Test
     public void unsafeTraversalPathIsSkippedAndSafePathSurvives() throws Exception {
         File input = zipOf("../outside.txt", "unsafe", "safe/inside.txt", "safe");
         File output = File.createTempFile("kaizen-safe", ".zip");
@@ -118,7 +100,7 @@ public class ArchiveProcessorTest {
         File input = sevenZOf("nested/card-data.txt", "seven zip payload");
         File output = File.createTempFile("kaizen-7z-output", ".zip");
         try {
-            ArchiveProcessor.Result result = filterTo(input, "sample.7z", ArchiveProcessor.MODE_CARDS, output);
+            ArchiveProcessor.Result result = filterTo(input, "sample.7z", ArchiveProcessor.MODE_DEFAULT, output);
             assertEquals("SEVEN_Z", result.archiveType);
             assertEquals(1, result.keptFiles);
             assertTrue(entryNames(output).contains("nested/card-data.txt"));
@@ -267,112 +249,6 @@ public class ArchiveProcessorTest {
         } catch (ArchiveProcessor.OperationCancelledException expected) {
             assertTrue(cancelled.get());
         } finally { input.delete(); output.delete(); }
-    }
-
-    @Test
-    public void formatCardsEmitsOnlyCompleteCardsInPipeFormat() throws Exception {
-        File input = zipOf("dump/cards.txt",
-                "4242424242424242|12|28|128\n"
-                        + "5555555555554444 12/2028 392\n"
-                        + "4111111111111111|01-31|007\n"
-                        + "no card here\n"
-                        + "4000000000000002|03|30\n"
-                        + "4999999999999999|12|28|123\n");
-        try {
-            assertEquals("number|mm|yy|cvv\n"
-                            + "************4242|**|**|***\n"
-                            + "************4444|**|**|***\n"
-                            + "************1111|**|**|***\n"
-                            + "************9999|**|**|***\n",
-                    formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsHandlesMultiLineCardBlocks() throws Exception {
-        File input = zipOf("cards_export.txt",
-                "Card: 4242424242424242\nExp: 12/28\nCVV: 128\n");
-        try {
-            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsSkipsRecordWithFourDigitCvv() throws Exception {
-        File input = zipOf("cards.txt", "4242424242424242|12|28|1234\n");
-        try {
-            // Only the four-digit CVV exists, so nothing complete can be built.
-            ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_FORMAT_CARDS, new ByteArrayOutputStream());
-            throw new AssertionError("Expected NoMatchesException");
-        } catch (ArchiveProcessor.NoMatchesException expected) {
-            assertTrue(expected.getMessage().contains("kart bilgisi"));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsDeduplicatesRepeatedRows() throws Exception {
-        File input = zipOf("cards_a.txt", "4242424242424242|12|28|128\n",
-                "cards_b.txt", "4242424242424242|12|28|128\n");
-        try {
-            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsIgnoresFilesWithoutCardInName() throws Exception {
-        File input = zipOf("notes.txt", "4242424242424242|12|28|128\n");
-        try {
-            ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_FORMAT_CARDS, new ByteArrayOutputStream());
-            throw new AssertionError("Expected NoMatchesException");
-        } catch (ArchiveProcessor.NoMatchesException expected) {
-            assertTrue(expected.getMessage().contains("kart bilgisi"));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsHandlesCrlfLineEndings() throws Exception {
-        File input = zipOf("cards.txt", "4242424242424242|12|28|128\r\n4242424242424242|01|29|321\r\n");
-        try {
-            assertEquals("number|mm|yy|cvv\n"
-                            + "************4242|**|**|***\n"
-                            + "************4242|**|**|***\n",
-                    formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsParsesUtf16LeContent() throws Exception {
-        byte[] utf16 = "\uFEFF4242424242424242|12|28|128\r\n".getBytes(StandardCharsets.UTF_16LE);
-        File input = zipOfBytes("cards.txt", utf16);
-        try {
-            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    @Test
-    public void formatCardsParsesUtf16BeContent() throws Exception {
-        byte[] utf16 = "\uFEFF4242424242424242|12|28|128\n".getBytes(StandardCharsets.UTF_16BE);
-        File input = zipOfBytes("cards.txt", utf16);
-        try {
-            assertEquals("number|mm|yy|cvv\n************4242|**|**|***\n", formatCards(input));
-        } finally { input.delete(); }
-    }
-
-    private static String formatCards(File input) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        ArchiveProcessor.filter(input, "sample.zip", ArchiveProcessor.MODE_FORMAT_CARDS, out);
-        try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(out.toByteArray()))) {
-            ZipEntry entry = zip.getNextEntry();
-            assertEquals("masked_cards.txt", entry == null ? null : entry.getName());
-            ByteArrayOutputStream report = new ByteArrayOutputStream();
-            byte[] buffer = new byte[1024];
-            int read;
-            while ((read = zip.read(buffer)) != -1) {
-                if (read > 0) report.write(buffer, 0, read);
-            }
-            assertEquals("Format Cards output must contain exactly one report file", null, zip.getNextEntry());
-            return new String(report.toByteArray(), StandardCharsets.UTF_8);
-        }
     }
 
     private static ArchiveProcessor.Result filterTo(File input, String name, int mode, File output) throws Exception {
