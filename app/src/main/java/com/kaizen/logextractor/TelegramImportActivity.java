@@ -61,12 +61,12 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
         noteParams.topMargin = dp(12);
         page.addView(note, noteParams);
 
-        connectButton = button("Telegram hesabına bağlan", this::connectTelegram);
+        connectButton = button("Telegram hesabına bağlan", v -> connectTelegram());
         LinearLayout.LayoutParams connectParams = new LinearLayout.LayoutParams(-1, -2);
         connectParams.topMargin = dp(24);
         page.addView(connectButton, connectParams);
 
-        refreshButton = button("Sohbetleri yenile", () -> manager.loadChats());
+        refreshButton = button("Sohbetleri yenile", v -> manager.loadChats());
         LinearLayout.LayoutParams refreshParams = new LinearLayout.LayoutParams(-1, -2);
         refreshParams.topMargin = dp(10);
         page.addView(refreshButton, refreshParams);
@@ -83,7 +83,7 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
         page.addView(logoutButton, logoutParams);
         logoutButton.setVisibility(View.GONE);
 
-        settingsButton = button("API ID / Hash bilgilerini değiştir", this::showCredentialsDialog);
+        settingsButton = button("API ID / Hash bilgilerini değiştir", v -> showCredentialsDialog());
         LinearLayout.LayoutParams settingsParams = new LinearLayout.LayoutParams(-1, -2);
         settingsParams.topMargin = dp(10);
         page.addView(settingsButton, settingsParams);

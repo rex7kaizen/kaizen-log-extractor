@@ -675,10 +675,6 @@ final class TelegramTdLibManager {
             }
             return;
         }
-        if (state instanceof TdApi.AuthorizationStateWaitEncryptionKey) {
-            send(new TdApi.CheckDatabaseEncryptionKey(databaseKey), "TDLib veritabanı kilidi açılamadı.");
-            return;
-        }
         if (state instanceof TdApi.AuthorizationStateWaitPhoneNumber) {
             pendingInput = InputKind.PHONE;
             pendingInputHint = "Ülke koduyla Telegram telefon numaran";
