@@ -291,7 +291,7 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
                     }
                     Intent result = new Intent();
                     result.putIntegerArrayListExtra(EXTRA_FILE_IDS, fileIds);
-                    result.putLongArrayExtra(EXTRA_FILE_SIZES, fileSizes);
+                    result.putExtra(EXTRA_FILE_SIZES, fileSizes);
                     result.putStringArrayListExtra(EXTRA_FILE_NAMES, fileNames);
                     setResult(RESULT_OK, result);
                     statusView.setText("Seçilen arşivler uygulamaya aktarıldı; içerik işlenirken yalnızca ihtiyaç duyulan parçalar alınacak.");
