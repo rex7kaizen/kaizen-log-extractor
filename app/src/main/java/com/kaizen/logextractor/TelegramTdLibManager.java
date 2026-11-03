@@ -1,5 +1,6 @@
 package com.kaizen.logextractor;
 
+import java.nio.channels.SeekableByteChannel;
 import android.content.Context;
 import android.os.Build;
 import android.os.Handler;
@@ -18,23 +19,20 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 /** TDLib adapter. It exposes bounded chat/history browsing and one-at-a-time archive imports. */
 final class TelegramTdLibManager {
     private static final String TAG = "KaizenTelegram";
-    private static final int MAX_CHATS = 50;
+    private static final int MAX_CHATS = 200;
+    private static final int MAX_CHAT_LOAD_ATTEMPTS = 6;
+    private static final int MAX_TOTAL_CHATS = 500;
+    private static final int MAX_CUSTOM_CHAT_FOLDERS = 10;
+    private static final int CHAT_DETAIL_BATCH_SIZE = 20;
     private static final int MAX_MESSAGES = 100;
     private static final int MAX_ARCHIVES = 5;
-    private static final int MAX_HISTORY_MESSAGES_TO_SCAN = 5_000;
+    private static final int MAX_HISTORY_MESSAGES_TO_SCAN = 20000;
     private static final long MAX_DOWNLOAD_BYTES = ArchiveProcessor.MAX_INPUT_BYTES;
-    private static final long DOWNLOAD_TIMEOUT_HOURS = 12L;
     private static volatile TelegramTdLibManager instance;
 
     enum InputKind { PHONE, CODE, PASSWORD }
@@ -45,7 +43,6 @@ final class TelegramTdLibManager {
         void onReady();
         void onChatsLoaded(List<ChatItem> chats);
         void onArchivesLoaded(ChatItem chat, List<ArchiveItem> archives);
-        void onArchiveImported(File file, String originalName);
         void onLoggedOut();
         void onError(String message);
     }
@@ -83,23 +80,9 @@ final class TelegramTdLibManager {
     private final Context context;
     private final TelegramCredentialStore credentialStore;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService fileWorker = Executors.newSingleThreadExecutor(r -> {
-        Thread thread = new Thread(r, "kaizen-telegram-import");
-        thread.setDaemon(true);
-        return thread;
-    });
     private final AtomicBoolean requestInProgress = new AtomicBoolean(false);
     private final AtomicBoolean parametersSent = new AtomicBoolean(false);
-    private final AtomicBoolean downloadAwaitingResult = new AtomicBoolean(false);
-    private final AtomicBoolean importingFile = new AtomicBoolean(false);
-    private final AtomicBoolean importCancellationRequested = new AtomicBoolean(false);
-    private final AtomicLong downloadGeneration = new AtomicLong();
     private final AtomicBoolean logoutRequested = new AtomicBoolean(false);
-    private final ScheduledExecutorService timeoutWorker = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread thread = new Thread(r, "kaizen-telegram-timeout");
-        thread.setDaemon(true);
-        return thread;
-    });
     private volatile Listener listener;
     private volatile Client client;
     private volatile boolean authorized;
@@ -110,8 +93,7 @@ final class TelegramTdLibManager {
     private volatile String apiHash;
     private volatile TdApi.AuthorizationState pendingAuthorizationState;
     private volatile TdApi.AuthorizationState currentAuthorizationState;
-    private volatile ScheduledFuture<?> activeDownloadTimeout;
-    private volatile int activeDownloadFileId;
+    private volatile int[] chatFolderIds = new int[0];
 
     private TelegramTdLibManager(Context context) {
         this.context = context.getApplicationContext();
@@ -141,36 +123,10 @@ final class TelegramTdLibManager {
     }
 
     void detach(Listener listener) {
-        if (this.listener == listener) {
-            this.listener = null;
-            cancelDownloadForDetachedScreen();
-        }
+        if (this.listener == listener) this.listener = null;
     }
 
-    private void cancelDownloadForDetachedScreen() {
-        if (!downloadAwaitingResult.compareAndSet(true, false)) {
-            if (importingFile.get()) importCancellationRequested.set(true);
-            return;
-        }
-        downloadGeneration.incrementAndGet();
-        int fileId = activeDownloadFileId;
-        activeDownloadFileId = 0;
-        ScheduledFuture<?> timeout = activeDownloadTimeout;
-        if (timeout != null) timeout.cancel(false);
-        requestInProgress.set(false);
-        Client active = client;
-        if (active == null || fileId <= 0) return;
-        try {
-            active.send(new TdApi.CancelDownloadFile(fileId, false), object -> {
-                if (object instanceof TdApi.Error) {
-                    TdApi.Error error = (TdApi.Error) object;
-                    Log.w(TAG, "Download cancellation after screen exit failed " + error.code + ": " + error.message);
-                }
-            });
-        } catch (RuntimeException e) {
-            Log.e(TAG, "Could not cancel download after screen exit", e);
-        }
-    }
+
 
     TelegramCredentialStore credentialStore() {
         return credentialStore;
@@ -313,82 +269,138 @@ final class TelegramTdLibManager {
             emitStatus("Başka bir Telegram isteği devam ediyor…");
             return;
         }
-        emitStatus("Ana sohbet listesi yükleniyor…");
+        emitStatus("Ana, arşivlenmiş ve özel klasörlerdeki sohbetler yükleniyor…");
+        List<TdApi.ChatList> lists = new ArrayList<>();
+        lists.add(new TdApi.ChatListMain());
+        lists.add(new TdApi.ChatListArchive());
+        int[] folderIds = chatFolderIds;
+        if (folderIds != null) {
+            int count = Math.min(folderIds.length, MAX_CUSTOM_CHAT_FOLDERS);
+            for (int i = 0; i < count; i++) {
+                if (folderIds[i] > 0) lists.add(new TdApi.ChatListFolder(folderIds[i]));
+            }
+        }
+        loadChatList(active, lists, 0, new java.util.LinkedHashSet<>());
+    }
+
+    private void loadChatList(Client active, List<TdApi.ChatList> lists, int listIndex,
+                              java.util.LinkedHashSet<Long> chatIds) {
+        if (chatIds.size() >= MAX_TOTAL_CHATS || listIndex >= lists.size()) {
+            fetchChatDetails(active, new ArrayList<>(chatIds), 0,
+                    Collections.synchronizedList(new ArrayList<>()));
+            return;
+        }
+        loadChatListPage(active, lists, listIndex, lists.get(listIndex), 0, chatIds);
+    }
+
+    private void loadChatListPage(Client active, List<TdApi.ChatList> lists, int listIndex,
+                                  TdApi.ChatList chatList, int attempt,
+                                  java.util.LinkedHashSet<Long> chatIds) {
+        if (attempt >= MAX_CHAT_LOAD_ATTEMPTS || chatIds.size() >= MAX_TOTAL_CHATS) {
+            readChatIds(active, lists, listIndex, chatList, attempt, true, chatIds);
+            return;
+        }
         try {
-            active.send(new TdApi.LoadChats(new TdApi.ChatListMain(), MAX_CHATS), object -> {
+            active.send(new TdApi.LoadChats(chatList, MAX_CHATS), object -> {
                 if (object instanceof TdApi.Error) {
                     TdApi.Error error = (TdApi.Error) object;
-                    // TDLib uses 404 to signal that the requested list has no more chats.
                     if (error.code != 404) {
-                        requestInProgress.set(false);
-                        reportIfError(object, "Sohbet listesi yüklenemedi.");
-                        return;
+                        Log.e(TAG, "LoadChats failed for one Telegram list (" + error.code + "): " + error.message);
                     }
-                } else if (!(object instanceof TdApi.Ok)) {
-                    requestInProgress.set(false);
-                    emitError("TDLib sohbet yükleme isteği için beklenmeyen bir yanıt döndürdü.");
+                    readChatIds(active, lists, listIndex, chatList, attempt, true, chatIds);
                     return;
                 }
-                fetchChats(active);
+                if (!(object instanceof TdApi.Ok)) {
+                    Log.e(TAG, "LoadChats returned an unexpected response: "
+                            + (object == null ? "null" : object.getClass().getSimpleName()));
+                    readChatIds(active, lists, listIndex, chatList, attempt, true, chatIds);
+                    return;
+                }
+                // TDLib may load fewer than requested while more chats remain. Read the
+                // loaded count before asking for another page to avoid redundant loading.
+                readChatIds(active, lists, listIndex, chatList, attempt + 1, false, chatIds);
             });
         } catch (RuntimeException e) {
-            requestInProgress.set(false);
             Log.e(TAG, "LoadChats request failed", e);
-            emitError("Sohbet listesi yüklenemedi: " + readableMessage(e));
+            readChatIds(active, lists, listIndex, chatList, attempt, true, chatIds);
         }
     }
 
-    private void fetchChats(Client active) {
+    private void readChatIds(Client active, List<TdApi.ChatList> lists, int listIndex,
+                             TdApi.ChatList chatList, int attempt, boolean listComplete,
+                             java.util.LinkedHashSet<Long> chatIds) {
         try {
-            active.send(new TdApi.GetChats(new TdApi.ChatListMain(), MAX_CHATS), object -> {
-                if (reportIfError(object, "Sohbet listesi alınamadı.")) {
-                    requestInProgress.set(false);
-                    return;
-                }
-                if (!(object instanceof TdApi.Chats)) {
-                    requestInProgress.set(false);
-                    emitError("TDLib sohbet listesi yerine beklenmeyen bir yanıt döndürdü.");
-                    return;
-                }
-                long[] ids = ((TdApi.Chats) object).chatIds;
-                if (ids == null || ids.length == 0) {
-                    requestInProgress.set(false);
-                    post(l -> l.onChatsLoaded(Collections.emptyList()));
-                    return;
-                }
-                int count = Math.min(ids.length, MAX_CHATS);
-                List<ChatItem> chats = Collections.synchronizedList(new ArrayList<>());
-                AtomicBoolean delivered = new AtomicBoolean(false);
-                java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(count);
-                for (int i = 0; i < count; i++) {
-                    final long chatId = ids[i];
-                    try {
-                        active.send(new TdApi.GetChat(chatId), chatObject -> {
-                            if (chatObject instanceof TdApi.Chat) {
-                                TdApi.Chat chat = (TdApi.Chat) chatObject;
-                                chats.add(new ChatItem(chat.id, chat.title));
-                            } else if (chatObject instanceof TdApi.Error) {
-                                TdApi.Error error = (TdApi.Error) chatObject;
-                                Log.w(TAG, "Could not load one chat (" + error.code + "): " + error.message);
-                            }
-                            if (remaining.decrementAndGet() == 0 && delivered.compareAndSet(false, true)) {
-                                deliverChats(chats);
-                            }
-                        });
-                    } catch (RuntimeException chatRequestError) {
-                        Log.e(TAG, "GetChat request failed for one chat", chatRequestError);
-                        if (remaining.decrementAndGet() == 0 && delivered.compareAndSet(false, true)) {
-                            deliverChats(chats);
+            active.send(new TdApi.GetChats(chatList, MAX_CHATS), object -> {
+                int returnedCount = 0;
+                boolean completeThisList = listComplete;
+                if (object instanceof TdApi.Chats) {
+                    long[] ids = ((TdApi.Chats) object).chatIds;
+                    returnedCount = ids == null ? 0 : ids.length;
+                    if (ids != null) {
+                        for (long id : ids) {
+                            if (id > 0L && chatIds.size() < MAX_TOTAL_CHATS) chatIds.add(id);
                         }
                     }
+                } else if (object instanceof TdApi.Error) {
+                    TdApi.Error error = (TdApi.Error) object;
+                    Log.e(TAG, "GetChats failed for one Telegram list (" + error.code + "): " + error.message);
+                    completeThisList = true;
+                } else {
+                    Log.e(TAG, "GetChats returned an unexpected response: "
+                            + (object == null ? "null" : object.getClass().getSimpleName()));
+                    completeThisList = true;
+                }
+                if (completeThisList || returnedCount >= MAX_CHATS
+                        || attempt >= MAX_CHAT_LOAD_ATTEMPTS || chatIds.size() >= MAX_TOTAL_CHATS) {
+                    loadChatList(active, lists, listIndex + 1, chatIds);
+                } else {
+                    loadChatListPage(active, lists, listIndex, chatList, attempt, chatIds);
                 }
             });
         } catch (RuntimeException e) {
-            requestInProgress.set(false);
             Log.e(TAG, "GetChats request failed", e);
-            emitError("Sohbet isteği gönderilemedi: " + readableMessage(e));
+            loadChatList(active, lists, listIndex + 1, chatIds);
         }
     }
+
+    private void fetchChatDetails(Client active, List<Long> ids, int start, List<ChatItem> chats) {
+        if (start >= ids.size()) {
+            deliverChats(chats);
+            return;
+        }
+        int end = Math.min(ids.size(), start + CHAT_DETAIL_BATCH_SIZE);
+        java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(end - start);
+        Runnable continueAfterBatch = () -> {
+            if (remaining.decrementAndGet() == 0) fetchChatDetails(active, ids, end, chats);
+        };
+        for (int i = start; i < end; i++) {
+            final long chatId = ids.get(i);
+            try {
+                active.send(new TdApi.GetChat(chatId), chatObject -> {
+                    try {
+                        if (chatObject instanceof TdApi.Chat) {
+                            TdApi.Chat chat = (TdApi.Chat) chatObject;
+                            chats.add(new ChatItem(chat.id, chat.title));
+                        } else if (chatObject instanceof TdApi.Error) {
+                            TdApi.Error error = (TdApi.Error) chatObject;
+                            Log.w(TAG, "Could not load Telegram chat " + chatId + " (" + error.code + "): " + error.message);
+                        } else {
+                            Log.w(TAG, "GetChat returned an unexpected response for " + chatId);
+                        }
+                    } catch (RuntimeException callbackError) {
+                        Log.e(TAG, "GetChat callback failed for " + chatId, callbackError);
+                    } finally {
+                        continueAfterBatch.run();
+                    }
+                });
+            } catch (RuntimeException e) {
+                Log.e(TAG, "GetChat request failed for " + chatId, e);
+                continueAfterBatch.run();
+            }
+        }
+    }
+
+
 
     private void deliverChats(List<ChatItem> chats) {
         requestInProgress.set(false);
@@ -411,12 +423,13 @@ final class TelegramTdLibManager {
             emitStatus("Başka bir Telegram isteği devam ediyor…");
             return;
         }
-        emitStatus("Sohbet geçmişinde en yeni " + MAX_ARCHIVES + " arşiv aranıyor…");
-        fetchArchivePage(active, chat, 0L, 0, new ArrayList<>(), new HashSet<>());
+        emitStatus("Sohbet geçmişinde en yeni arşivler aranıyor…");
+        fetchArchivePage(active, chat, 0L, 0, new ArrayList<>(), new HashSet<>(), new HashSet<>());
     }
 
     private void fetchArchivePage(Client active, ChatItem chat, long fromMessageId, int scannedMessages,
-                                  List<ArchiveItem> archives, Set<Integer> seenFileIds) {
+                                  List<ArchiveItem> archives, Set<Integer> seenFileIds,
+                                  Set<Long> seenMessageIds) {
         int remaining = MAX_HISTORY_MESSAGES_TO_SCAN - scannedMessages;
         if (archives.size() >= MAX_ARCHIVES || remaining <= 0) {
             finishArchiveScan(chat, archives);
@@ -439,29 +452,38 @@ final class TelegramTdLibManager {
                     finishArchiveScan(chat, archives);
                     return;
                 }
+                int newlySeenMessages = 0;
+                long oldestMessageId = Long.MAX_VALUE;
                 for (TdApi.Message message : messages) {
-                    if (message == null || !(message.content instanceof TdApi.MessageDocument)) continue;
+                    if (message == null || message.id <= 0L || !seenMessageIds.add(message.id)) continue;
+                    newlySeenMessages++;
+                    oldestMessageId = Math.min(oldestMessageId, message.id);
+                    if (!(message.content instanceof TdApi.MessageDocument)) continue;
                     TdApi.Document document = ((TdApi.MessageDocument) message.content).document;
                     if (document == null || document.document == null || document.document.id <= 0) continue;
                     String name = document.fileName;
                     if (!TelegramArchiveRules.isSingleArchiveName(name)) continue;
                     TdApi.File file = document.document;
-                    if (file.size > MAX_DOWNLOAD_BYTES || !seenFileIds.add(file.id)) continue;
+                    // expectedSize is explicitly approximate in TDLib; it cannot be used as
+                    // a seekable stream length. Unknown-size files are skipped safely.
+                    long size = file.size;
+                    if (size <= 0L || size > MAX_DOWNLOAD_BYTES || !seenFileIds.add(file.id)) continue;
                     try {
-                        archives.add(new ArchiveItem(chat.id, message.id, file.id,
-                                Math.max(0L, file.size), message.date, TelegramArchiveRules.sanitizeFileName(name)));
+                        archives.add(new ArchiveItem(chat.id, message.id, file.id, size,
+                                message.date, TelegramArchiveRules.sanitizeFileName(name)));
                     } catch (IllegalArgumentException e) {
                         Log.w(TAG, "Skipping Telegram document with unsafe name", e);
                     }
                 }
-                int nextScanned = scannedMessages + messages.length;
-                long oldestMessageId = messages[messages.length - 1].id;
-                if (archives.size() >= MAX_ARCHIVES || messages.length < pageLimit
-                        || nextScanned >= MAX_HISTORY_MESSAGES_TO_SCAN || oldestMessageId <= 0L
-                        || oldestMessageId == fromMessageId) {
+                int nextScanned = scannedMessages + newlySeenMessages;
+                long nextCursor = oldestMessageId == Long.MAX_VALUE ? 0L : oldestMessageId;
+                if (archives.size() >= MAX_ARCHIVES
+                        || !TelegramArchivePaging.shouldContinue(messages.length, newlySeenMessages,
+                                nextScanned, MAX_HISTORY_MESSAGES_TO_SCAN, fromMessageId, nextCursor)) {
                     finishArchiveScan(chat, archives);
                 } else {
-                    fetchArchivePage(active, chat, oldestMessageId, nextScanned, archives, seenFileIds);
+                    fetchArchivePage(active, chat, nextCursor, nextScanned, archives,
+                            seenFileIds, seenMessageIds);
                 }
             });
         } catch (RuntimeException e) {
@@ -473,108 +495,28 @@ final class TelegramTdLibManager {
 
     private void finishArchiveScan(ChatItem chat, List<ArchiveItem> archives) {
         requestInProgress.set(false);
-        archives.sort((left, right) -> Integer.compare(right.date, left.date));
+        archives.sort((left, right) -> {
+            int byDate = Integer.compare(right.date, left.date);
+            return byDate != 0 ? byDate : Long.compare(right.messageId, left.messageId);
+        });
         List<ArchiveItem> latestArchives = new ArrayList<>(archives.subList(0,
                 Math.min(MAX_ARCHIVES, archives.size())));
         post(l -> l.onArchivesLoaded(chat, latestArchives));
     }
 
-    void downloadArchive(ArchiveItem archive) {
-        if (archive == null || archive.fileId <= 0 || !TelegramArchiveRules.isSupportedArchiveName(archive.name)) {
-            emitError("Arşiv seçimi geçersiz.");
-            return;
-        }
-        if (archive.size > MAX_DOWNLOAD_BYTES) {
-            emitError("Seçilen arşiv mevcut 64 GiB sınırını aşıyor.");
-            return;
-        }
+
+
+
+
+    SeekableByteChannel openArchiveChannel(int fileId, long fileSize,
+                                                   java.util.function.BooleanSupplier cancelled) throws IOException {
         Client active = client;
-        if (active == null || !authorized) {
-            emitError("Telegram bağlantısı hazır değil.");
-            return;
+        if (active == null || !authorized) throw new IOException("Telegram bağlantısı hazır değil.");
+        if (fileId <= 0) throw new IOException("Telegram dosya kimliği geçersiz.");
+        if (fileSize <= 0L || fileSize > MAX_DOWNLOAD_BYTES) {
+            throw new IOException("Telegram arşiv boyutu geçersiz veya 64 GiB sınırını aşıyor.");
         }
-        if (!requestInProgress.compareAndSet(false, true)) {
-            emitStatus("Başka bir Telegram isteği devam ediyor…");
-            return;
-        }
-        Listener requestListener = listener;
-        if (requestListener == null) {
-            requestInProgress.set(false);
-            emitError("Telegram ekranı hazır değil. Yeniden açıp dene.");
-            return;
-        }
-        emitStatus("Seçilen arşiv indiriliyor: " + archive.name);
-        try {
-            // Synchronous mode completes only after success, failure, or cancellation.
-            final long generation = downloadGeneration.incrementAndGet();
-            importCancellationRequested.set(false);
-            importingFile.set(false);
-            activeDownloadFileId = archive.fileId;
-            downloadAwaitingResult.set(true);
-            activeDownloadTimeout = timeoutWorker.schedule(() -> {
-                if (downloadGeneration.get() != generation || !downloadAwaitingResult.compareAndSet(true, false)) return;
-                activeDownloadFileId = 0;
-                requestInProgress.set(false);
-                Client current = client;
-                if (current != null) {
-                    try {
-                        current.send(new TdApi.CancelDownloadFile(archive.fileId, false), cancelResult -> {
-                            if (cancelResult instanceof TdApi.Error) {
-                                TdApi.Error error = (TdApi.Error) cancelResult;
-                                Log.w(TAG, "TDLib download timeout cancel returned " + error.code + ": " + error.message);
-                            }
-                        });
-                    } catch (RuntimeException cancelError) {
-                        Log.e(TAG, "Could not request TDLib download cancellation", cancelError);
-                    }
-                }
-                emitError("Telegram indirmesi 12 saat içinde tamamlanmadı; iptal isteği gönderildi.");
-            }, DOWNLOAD_TIMEOUT_HOURS, TimeUnit.HOURS);
-            active.send(new TdApi.DownloadFile(archive.fileId, 32, 0L, 0L, true), object -> {
-                if (downloadGeneration.get() != generation || !downloadAwaitingResult.compareAndSet(true, false)) return;
-                importingFile.set(true);
-                activeDownloadFileId = 0;
-                ScheduledFuture<?> timeout = activeDownloadTimeout;
-                if (timeout != null) timeout.cancel(false);
-                if (reportIfError(object, "Telegram dosyası indirilemedi.")) {
-                    importingFile.set(false);
-                    requestInProgress.set(false);
-                    return;
-                }
-                if (!(object instanceof TdApi.File)) {
-                    importingFile.set(false);
-                    requestInProgress.set(false);
-                    emitError("TDLib dosya indirme sonucu yerine beklenmeyen bir yanıt döndürdü.");
-                    return;
-                }
-                TdApi.File downloaded = (TdApi.File) object;
-                if (downloaded.local == null || !downloaded.local.isDownloadingCompleted
-                        || downloaded.local.path == null || downloaded.local.path.trim().isEmpty()) {
-                    importingFile.set(false);
-                    requestInProgress.set(false);
-                    emitError("Telegram indirmesi tamamlandı olarak işaretlenmedi; dosya içe aktarılmadı.");
-                    return;
-                }
-                final String path = downloaded.local.path;
-                try {
-                    fileWorker.execute(() -> deliverDownloadedFile(path, archive.name, requestListener));
-                } catch (java.util.concurrent.RejectedExecutionException e) {
-                    importingFile.set(false);
-                    requestInProgress.set(false);
-                    Log.e(TAG, "Telegram file worker rejected import", e);
-                    emitError("Telegram dosya işçisi şu anda kullanılamıyor.");
-                }
-            });
-        } catch (RuntimeException e) {
-            downloadGeneration.incrementAndGet();
-            downloadAwaitingResult.set(false);
-            activeDownloadFileId = 0;
-            ScheduledFuture<?> timeout = activeDownloadTimeout;
-            if (timeout != null) timeout.cancel(false);
-            requestInProgress.set(false);
-            Log.e(TAG, "DownloadFile request failed", e);
-            emitError("İndirme başlatılamadı: " + readableMessage(e));
-        }
+        return new TelegramSeekableByteChannel(active, fileId, fileSize, cancelled);
     }
 
     /**
@@ -582,50 +524,21 @@ final class TelegramTdLibManager {
      * No second full-size copy is created. TDLib DownloadFile itself still writes
      * the original download to the app-private tdlib/files directory.
      */
-    private void deliverDownloadedFile(String sourcePath, String originalName, Listener expectedListener) {
-        boolean callbackPosted = false;
-        try {
-            if (expectedListener == null || listener != expectedListener || importCancellationRequested.get()) {
-                throw new IOException("Telegram ekranı kapatıldığı için içe aktarma iptal edildi.");
-            }
-            File source = new File(sourcePath).getCanonicalFile();
-            File tdlibFilesRoot = new File(context.getFilesDir(), "tdlib/files").getCanonicalFile();
-            String rootPrefix = tdlibFilesRoot.getPath() + File.separator;
-            if (!source.getPath().startsWith(rootPrefix)) {
-                throw new IOException("TDLib indirme yolu uygulamanın özel dosya klasörünün dışında.");
-            }
-            if (!source.isFile() || !source.canRead()) throw new IOException("TDLib indirme dosyası okunamıyor.");
-            long sourceLength = source.length();
-            if (sourceLength <= 0L) throw new IOException("Telegram'dan indirilen dosya boş.");
-            if (sourceLength > MAX_DOWNLOAD_BYTES) throw new IOException("İndirilen dosya 64 GiB sınırını aşıyor.");
 
-            File imported = source;
-            String safeName = TelegramArchiveRules.sanitizeFileName(originalName);
-            callbackPosted = mainHandler.post(() -> {
-                importingFile.set(false);
-                requestInProgress.set(false);
-                try {
-                    if (listener == expectedListener && expectedListener != null) {
-                        expectedListener.onArchiveImported(imported, safeName);
-                    }
-                } catch (RuntimeException callbackError) {
-                    Log.e(TAG, "Telegram import result callback failed", callbackError);
-                    emitError("İçe aktarılan arşiv ekrana aktarılamadı: " + readableMessage(callbackError));
-                }
-            });
-            if (!callbackPosted) throw new IOException("Telegram içe aktarma sonucu uygulama ekranına iletilemedi.");
-        } catch (Exception e) {
-            Log.e(TAG, "Telegram archive delivery failed", e);
-            emitError("Telegram arşivi içe aktarılamadı: " + readableMessage(e));
-        } finally {
-            if (!callbackPosted) {
-                importingFile.set(false);
-                requestInProgress.set(false);
-            }
-        }
-    }
 
     private void onUpdate(TdApi.Object object) {
+        if (object instanceof TdApi.UpdateChatFolders) {
+            TdApi.ChatFolderInfo[] folders = ((TdApi.UpdateChatFolders) object).chatFolders;
+            if (folders == null || folders.length == 0) {
+                chatFolderIds = new int[0];
+            } else {
+                int count = Math.min(folders.length, MAX_CUSTOM_CHAT_FOLDERS);
+                int[] ids = new int[count];
+                for (int i = 0; i < count; i++) ids[i] = folders[i] == null ? 0 : folders[i].id;
+                chatFolderIds = ids;
+            }
+        }
+
         if (object instanceof TdApi.UpdateAuthorizationState) {
             TdApi.AuthorizationState state = ((TdApi.UpdateAuthorizationState) object).authorizationState;
             if (client == null) pendingAuthorizationState = state;

@@ -16,7 +16,6 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -25,7 +24,8 @@ import java.util.Locale;
 
 /** UI for securely connecting Telegram and importing selected archive attachments. */
 public final class TelegramImportActivity extends Activity implements TelegramTdLibManager.Listener {
-    static final String EXTRA_FILE_PATHS = "com.kaizen.logextractor.telegram.FILE_PATHS";
+    static final String EXTRA_FILE_IDS = "com.kaizen.logextractor.telegram.FILE_IDS";
+    static final String EXTRA_FILE_SIZES = "com.kaizen.logextractor.telegram.FILE_SIZES";
     static final String EXTRA_FILE_NAMES = "com.kaizen.logextractor.telegram.FILE_NAMES";
     private static final String TAG = "KaizenTelegramUI";
 
@@ -36,10 +36,6 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
     private TextView logoutButton;
     private TextView settingsButton;
     private boolean inputDialogVisible;
-    private final List<TelegramTdLibManager.ArchiveItem> pendingDownloads = new ArrayList<>();
-    private final ArrayList<String> downloadedPaths = new ArrayList<>();
-    private final ArrayList<String> downloadedNames = new ArrayList<>();
-    private int downloadIndex;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -62,7 +58,7 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
 
         TextView title = text("TELEGRAM  /  TDLib", 24, Color.rgb(225, 213, 255), true);
         page.addView(title);
-        TextView note = text("Kendi Telegram hesabına bağlan. Ana sohbet listesindeki en fazla 50 sohbetin son 50 mesajındaki tek dosyalık ZIP, JAR, RAR ve 7Z eklerini görüntüle; seçtiğin tek arşivi indir. Numaralı çok parçalı arşivler bu ekrandan alınmaz.",
+        TextView note = text("Kendi Telegram hesabına bağlan. Ana, arşivlenmiş ve özel klasörlerdeki sohbetleri tara; en yeni ZIP, JAR, RAR ve 7Z eklerini seç. Arşivler önceden indirilmez, gerekli veri parçaları işlendiği sırada alınır.",
                 14, Color.rgb(180, 177, 190), false);
         LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(-1, -2);
         noteParams.topMargin = dp(12);
@@ -239,7 +235,7 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
         String[] labels = new String[safeChats.size()];
         for (int i = 0; i < safeChats.size(); i++) labels[i] = safeChats.get(i).title;
         new AlertDialog.Builder(this)
-                .setTitle("Sohbet seç · en fazla 50")
+                .setTitle("Sohbet seç")
                 .setItems(labels, (dialog, which) -> manager.loadArchives(safeChats.get(which)))
                 .setNegativeButton("İptal", null)
                 .show();
@@ -266,56 +262,49 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
                 .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> {
                     TelegramTdLibManager.ArchiveItem item = safeArchives.get(which);
                     if (isChecked) {
-                        if (!selected.contains(item)) selected.add(item);
+                        if (!selected.contains(item) && selected.size() < 5) selected.add(item);
+                        else if (selected.size() >= 5) {
+                            ((AlertDialog) dialog).getListView().setItemChecked(which, false);
+                            Toast.makeText(this, "En fazla 5 arşiv seçebilirsin.", Toast.LENGTH_SHORT).show();
+                        }
                     } else {
                         selected.remove(item);
                     }
                 })
-                .setPositiveButton("Seçilenleri indir", (dialog, which) -> {
+                .setPositiveButton("Seçilenleri kullan", (dialog, which) -> {
                     if (selected.isEmpty()) {
-                        statusView.setText("İndirmek için en az bir arşiv seç.");
+                        statusView.setText("İşlemek için en az bir arşiv seç.");
                         return;
                     }
-                    selected.sort((left, right) -> Integer.compare(right.date, left.date));
-                    pendingDownloads.clear();
-                    pendingDownloads.addAll(selected);
-                    downloadedPaths.clear();
-                    downloadedNames.clear();
-                    downloadIndex = 0;
-                    downloadNextSelectedArchive();
+                    selected.sort((left, right) -> {
+                        int byDate = Integer.compare(right.date, left.date);
+                        return byDate != 0 ? byDate : Long.compare(right.messageId, left.messageId);
+                    });
+                    ArrayList<Integer> fileIds = new ArrayList<>();
+                    ArrayList<String> fileNames = new ArrayList<>();
+                    long[] fileSizes = new long[selected.size()];
+                    for (int i = 0; i < selected.size(); i++) {
+                        TelegramTdLibManager.ArchiveItem item = selected.get(i);
+                        fileIds.add(item.fileId);
+                        fileNames.add(item.name);
+                        fileSizes[i] = item.size;
+                    }
+                    Intent result = new Intent();
+                    result.putIntegerArrayListExtra(EXTRA_FILE_IDS, fileIds);
+                    result.putLongArrayExtra(EXTRA_FILE_SIZES, fileSizes);
+                    result.putStringArrayListExtra(EXTRA_FILE_NAMES, fileNames);
+                    setResult(RESULT_OK, result);
+                    statusView.setText("Seçilen arşivler uygulamaya aktarıldı; içerik işlenirken yalnızca ihtiyaç duyulan parçalar alınacak.");
+                    finish();
                 })
                 .setNegativeButton("İptal", null)
                 .show();
         statusView.setText(safeArchives.size() + " arşiv bulundu. En yeni dosyalar üstte; birden fazlasını seçebilirsin.");
     }
 
-    private void downloadNextSelectedArchive() {
-        if (downloadIndex >= pendingDownloads.size()) {
-            Intent result = new Intent();
-            result.putStringArrayListExtra(EXTRA_FILE_PATHS, new ArrayList<>(downloadedPaths));
-            result.putStringArrayListExtra(EXTRA_FILE_NAMES, new ArrayList<>(downloadedNames));
-            setResult(RESULT_OK, result);
-            Toast.makeText(this, downloadedPaths.size() + " arşiv hazır.", Toast.LENGTH_SHORT).show();
-            finish();
-            return;
-        }
-        TelegramTdLibManager.ArchiveItem next = pendingDownloads.get(downloadIndex);
-        statusView.setText("Telegram arşivi indiriliyor: " + (downloadIndex + 1) + "/"
-                + pendingDownloads.size() + " · " + next.name);
-        manager.downloadArchive(next);
-    }
 
-    @Override public void onArchiveImported(File file, String originalName) {
-        if (file == null || !file.isFile() || file.length() <= 0L
-                || file.length() > ArchiveProcessor.MAX_INPUT_BYTES) {
-            onError("İçe aktarılan dosya geçersiz veya boyut sınırını aşıyor.");
-            return;
-        }
-        downloadedPaths.add(file.getAbsolutePath());
-        downloadedNames.add(originalName);
-        downloadIndex++;
-        downloadNextSelectedArchive();
-    }
+
+
 
     private static String humanDate(int unixSeconds) {
         if (unixSeconds <= 0) return "tarih bilinmiyor";
@@ -332,10 +321,6 @@ public final class TelegramImportActivity extends Activity implements TelegramTd
     }
 
     @Override public void onError(String message) {
-        pendingDownloads.clear();
-        downloadedPaths.clear();
-        downloadedNames.clear();
-        downloadIndex = 0;
         statusView.setText(message);
         settingsButton.setVisibility(manager.canEditCredentials() ? View.VISIBLE : View.GONE);
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();

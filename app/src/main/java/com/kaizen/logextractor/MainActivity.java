@@ -1,5 +1,6 @@
 package com.kaizen.logextractor;
 
+import java.nio.channels.SeekableByteChannel;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.Intent;
@@ -388,27 +389,26 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_TELEGRAM_ARCHIVE) {
             if (resultCode != RESULT_OK || data == null) return;
-            ArrayList<String> paths = data.getStringArrayListExtra(TelegramImportActivity.EXTRA_FILE_PATHS);
+            ArrayList<Integer> fileIds = data.getIntegerArrayListExtra(TelegramImportActivity.EXTRA_FILE_IDS);
+            long[] fileSizes = data.getLongArrayExtra(TelegramImportActivity.EXTRA_FILE_SIZES);
             ArrayList<String> names = data.getStringArrayListExtra(TelegramImportActivity.EXTRA_FILE_NAMES);
-            if (paths == null || names == null || paths.isEmpty() || paths.size() > 5 || paths.size() != names.size()) {
-                statusView.setText("Telegram içe aktarma sonucu geçersiz. Yeniden dene.");
+            if (fileIds == null || names == null || fileSizes == null || fileIds.isEmpty()
+                    || fileIds.size() > 5 || names.size() != fileIds.size() || fileSizes.length != fileIds.size()) {
+                statusView.setText("Telegram arşiv seçimi geçersiz. Yeniden dene.");
                 return;
             }
             try {
-                File tdlibRoot = new File(getFilesDir(), "tdlib/files").getCanonicalFile();
-                String rootPrefix = tdlibRoot.getPath() + File.separator;
                 List<PickedArchive> imported = new ArrayList<>();
-                for (int i = 0; i < paths.size(); i++) {
+                for (int i = 0; i < fileIds.size(); i++) {
+                    int fileId = fileIds.get(i);
+                    long fileSize = fileSizes[i];
                     String name = names.get(i);
-                    if (!TelegramArchiveRules.isSupportedArchiveName(name)) {
-                        throw new IOException("Telegram arşiv adı geçersiz: " + name);
+                    if (fileId <= 0 || fileSize <= 0L || fileSize > ArchiveProcessor.MAX_INPUT_BYTES
+                            || !TelegramArchiveRules.isSingleArchiveName(name)) {
+                        throw new IOException("Telegram arşiv bilgisi geçersiz: " + name);
                     }
-                    File file = new File(paths.get(i)).getCanonicalFile();
-                    if (!file.getPath().startsWith(rootPrefix) || !file.isFile()
-                            || file.length() <= 0L || file.length() > MAX_INPUT_BYTES) {
-                        throw new IOException("Telegram dosyası TDLib'in özel indirme klasöründe değil veya boyutu geçersiz.");
-                    }
-                    imported.add(new PickedArchive(Uri.fromFile(file), safeLocalName(name)));
+                    imported.add(new PickedArchive(fileId, fileSize,
+                            TelegramArchiveRules.sanitizeFileName(name)));
                 }
                 selectedArchives.clear();
                 selectedArchives.addAll(imported);
@@ -418,7 +418,7 @@ public final class MainActivity extends Activity {
                 archiveNameView.setText(imported.size() == 1 ? first.name
                         : first.name + "  +  " + (imported.size() - 1) + " arşiv");
                 partsFolderView.setText("Parça klasörü: seçilmedi");
-                statusView.setText(imported.size() + " Telegram arşivi seçildi. Her biri ayrı ZIP çıktısı olarak işlenecek.");
+                statusView.setText(imported.size() + " Telegram arşivi seçildi. Dosyalar önceden indirilmeden, gerektiğinde 1 MiB parçalar halinde okunacak.");
             } catch (Exception e) {
                 Log.e(TAG, "Telegram archive result rejected", e);
                 String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -576,25 +576,20 @@ public final class MainActivity extends Activity {
                 || !isExpectedOutputFolder(folderUri)) {
             throw new IOException("Kaizen_LOGS klasörüne yazma izni yok. Klasörü yeniden seç.");
         }
-        File tdlibRoot = new File(getFilesDir(), "tdlib/files").getCanonicalFile();
-        String rootPrefix = tdlibRoot.getPath() + File.separator;
-        String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new java.util.Date());
+        String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+                .format(new java.util.Date());
         int totalScanned = 0;
         int totalKept = 0;
         int totalSkipped = 0;
-        StringBuilder report = new StringBuilder("Telegram arşivleri ayrı ayrı işlendi: ").append(picked.size());
+        StringBuilder report = new StringBuilder("Telegram arşivleri parça parça işlendi: ").append(picked.size());
+        List<DocumentFile> completedOutputs = new ArrayList<>();
+        try {
         for (int i = 0; i < picked.size(); i++) {
             checkJobCancelled();
             PickedArchive item = picked.get(i);
-            if (item.uri == null || !"file".equalsIgnoreCase(item.uri.getScheme())) {
-                throw new IOException("Telegram arşiv yolu geçersiz: " + item.name);
-            }
-            File source = new File(item.uri.getPath()).getCanonicalFile();
-            if (!source.getPath().startsWith(rootPrefix) || !source.isFile() || !source.canRead()) {
-                throw new IOException("Telegram arşivi TDLib'in özel dosya klasöründe bulunamadı: " + item.name);
-            }
-            if (source.length() <= 0L || source.length() > MAX_INPUT_BYTES) {
-                throw new IOException("Telegram arşiv boyutu geçersiz: " + item.name);
+            if (item.telegramFileId <= 0 || item.size <= 0L || item.size > ArchiveProcessor.MAX_INPUT_BYTES
+                    || !TelegramArchiveRules.isSingleArchiveName(item.name)) {
+                throw new IOException("Telegram arşiv bilgisi geçersiz: " + item.name);
             }
             String outputName = "Kaizen_LOG_EXTRACTOR_Telegram_" + timestamp + "_" + (i + 1)
                     + "_" + safeOutputBase(item.name) + ".zip";
@@ -604,13 +599,13 @@ public final class MainActivity extends Activity {
             try {
                 final int archiveIndex = i;
                 final int archiveCount = picked.size();
-                ArchiveProcessor.ProgressListener listener = new ArchiveProcessor.ProgressListener() {
+                ArchiveProcessor.ProgressListener progressListener = new ArchiveProcessor.ProgressListener() {
                     @Override public boolean isCancelled() {
                         return cancelRequested.get() || Thread.currentThread().isInterrupted();
                     }
                     @Override public void onProgress(ArchiveProcessor.Progress progress) {
                         int overall = (int) (((long) archiveIndex * 100L + progress.percent) / archiveCount);
-                        postProgress(overall, "Telegram arşivi işleniyor " + (archiveIndex + 1) + "/" + archiveCount,
+                        postProgress(overall, "Telegram arşivi okunuyor " + (archiveIndex + 1) + "/" + archiveCount,
                                 item.name + " · " + progress.currentEntry, progress.scannedEntries,
                                 progress.keptFiles, progress.skippedEntries);
                     }
@@ -619,10 +614,15 @@ public final class MainActivity extends Activity {
                 try (OutputStream output = getContentResolver().openOutputStream(outputFile.getUri(), "w")) {
                     if (output == null) throw new IOException("Çıktı dosyası yazma için açılamadı: " + outputName);
                     checkJobCancelled();
-                    result = ArchiveProcessor.filter(source, item.name, ArchiveProcessor.MODE_DEFAULT,
-                            output, java.util.Collections.singletonList(source), listener);
+                    try (SeekableByteChannel input = TelegramTdLibManager.getInstance(this).openArchiveChannel(
+                            item.telegramFileId, item.size,
+                            () -> cancelRequested.get() || Thread.currentThread().isInterrupted())) {
+                        result = ArchiveProcessor.filter(input, item.size, item.name,
+                                ArchiveProcessor.MODE_DEFAULT, output, progressListener);
+                    }
                     checkJobCancelled();
                 }
+                completedOutputs.add(outputFile);
                 completed = true;
                 totalScanned += result.scannedEntries;
                 totalKept += result.keptFiles;
@@ -643,6 +643,14 @@ public final class MainActivity extends Activity {
         postProgress(100, "Tamamlandı", picked.size() + " Telegram arşivi işlendi",
                 totalScanned, totalKept, totalSkipped);
         return report.toString();
+        } catch (Exception batchError) {
+            for (DocumentFile completedOutput : completedOutputs) {
+                if (completedOutput.exists() && !completedOutput.delete()) {
+                    Log.w(TAG, "Failed Telegram batch cleanup left an earlier output: " + completedOutput.getName());
+                }
+            }
+            throw batchError;
+        }
     }
 
     private void startProcessing() {
@@ -666,7 +674,6 @@ public final class MainActivity extends Activity {
         final Uri sourceFolderUri = partsTreeUri;
         final int mode = ArchiveProcessor.MODE_DEFAULT;
         final boolean processTelegramBatch = selectedFromTelegram;
-        selectedFromTelegram = false;
         cancelRequested.set(false);
         lastProgressUpdateMs = 0L;
         lastProgressPercent = -1;
@@ -683,6 +690,7 @@ public final class MainActivity extends Activity {
                 if (processTelegramBatch) {
                     String batchReport = processTelegramArchiveBatch(picked, folderUri);
                     runOnUiThread(() -> {
+                        selectedFromTelegram = false;
                         setBusy(false, "✦  Telegram arşivleri tamamlandı");
                         statsView.setText(batchReport);
                         Toast.makeText(this, picked.size() + " Telegram arşivi işlendi.", Toast.LENGTH_LONG).show();
@@ -1077,7 +1085,22 @@ public final class MainActivity extends Activity {
     private static final class PickedArchive {
         final Uri uri;
         final String name;
-        PickedArchive(Uri uri, String name) { this.uri = uri; this.name = name; }
+        final int telegramFileId;
+        final long size;
+
+        PickedArchive(Uri uri, String name) {
+            this.uri = uri;
+            this.name = name;
+            this.telegramFileId = 0;
+            this.size = 0L;
+        }
+
+        PickedArchive(int telegramFileId, long size, String name) {
+            this.uri = null;
+            this.name = name;
+            this.telegramFileId = telegramFileId;
+            this.size = size;
+        }
     }
 
     private static final class SourceFile {

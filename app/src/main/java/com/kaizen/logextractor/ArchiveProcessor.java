@@ -1,5 +1,6 @@
 package com.kaizen.logextractor;
 
+import java.nio.ByteBuffer;
 import com.github.junrar.Archive;
 import com.github.junrar.rarfile.FileHeader;
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
@@ -105,6 +106,39 @@ final class ArchiveProcessor {
         throw new IOException("Dosya uzantısı ile arşiv imzası uyuşmuyor veya arşiv eksik. ZIP, JAR, RAR ve 7Z kabul edilir.");
     }
 
+static ArchiveType detectType(SeekableByteChannel channel, long size, String originalName) throws IOException {
+        if (channel == null || size < 4L || size > MAX_INPUT_BYTES) {
+            throw new IOException("Seçilen Telegram arşivi boş veya boyutu geçersiz.");
+        }
+        String name = baseName(originalName).toLowerCase(Locale.ROOT);
+        boolean zipName = name.endsWith(".zip") || name.endsWith(".jar")
+                || RAW_ZIP_PART.matcher(name).matches() || SPLIT_ZIP_DISK.matcher(name).matches();
+        boolean rarName = name.endsWith(".rar") || OLD_RAR_PART.matcher(name).matches();
+        boolean sevenZName = name.endsWith(".7z") || SEVEN_Z_PART.matcher(name).matches();
+        long originalPosition = channel.position();
+        byte[] header = new byte[8];
+        int length = 0;
+        try {
+            channel.position(0L);
+            ByteBuffer buffer = ByteBuffer.wrap(header);
+            while (buffer.hasRemaining()) {
+                int read = channel.read(buffer);
+                if (read < 0) break;
+                if (read == 0) continue;
+                length += read;
+            }
+        } finally {
+            channel.position(originalPosition);
+        }
+        if (zipName && length >= 4 && isZipSignature(header)) {
+            return name.endsWith(".jar") ? ArchiveType.JAR : ArchiveType.ZIP;
+        }
+        if (rarName && length >= 7 && isRarSignature(header, length)) return ArchiveType.RAR;
+        if (sevenZName && length >= 6 && isSevenZSignature(header)) return ArchiveType.SEVEN_Z;
+        throw new IOException("Dosya uzantısı ile arşiv imzası uyuşmuyor veya Telegram arşivi eksik. ZIP, JAR, RAR ve 7Z kabul edilir.");
+    }
+
+
     interface ProgressListener {
         boolean isCancelled();
         void onProgress(Progress progress);
@@ -158,6 +192,45 @@ final class ArchiveProcessor {
                          List<File> candidates) throws Exception {
         return filter(input, originalName, mode, destination, candidates, null);
     }
+
+static Result filter(SeekableByteChannel input, long inputSize, String originalName,
+                         int mode, OutputStream destination, ProgressListener listener) throws Exception {
+        if (mode != MODE_DEFAULT) throw new IllegalArgumentException("Bilinmeyen filtre modu.");
+        if (destination == null) throw new IOException("Çıktı akışı açılamadı.");
+        if (input == null) throw new IOException("Telegram arşiv kanalı açılamadı.");
+        if (inputSize <= 0L || inputSize > MAX_INPUT_BYTES) throw new IOException("Telegram arşiv boyutu geçersiz.");
+        long actualSize = input.size();
+        if (actualSize != inputSize) throw new IOException("Telegram arşiv boyutu değişti; güvenli okuma durduruldu.");
+        ProgressTracker progress = new ProgressTracker(listener == null ? NO_PROGRESS : listener);
+        progress.checkCancelled();
+        ArchiveType type = detectType(input, inputSize, originalName);
+        Stats stats = new Stats();
+        ZipArchiveOutputStream zipOutput = new ZipArchiveOutputStream(destination);
+        zipOutput.setUseZip64(Zip64Mode.AsNeeded);
+        EntrySink sink = new ZipSink(zipOutput);
+        try (ZipArchiveOutputStream closeableOutput = zipOutput) {
+            switch (type) {
+                case ZIP:
+                case JAR:
+                    filterZipChannel(input, originalName, mode, sink, stats, progress);
+                    break;
+                case RAR:
+                    filterRarChannel(input, inputSize, mode, sink, stats, false, progress);
+                    break;
+                case SEVEN_Z:
+                    filterSevenZChannel(input, mode, sink, stats, progress);
+                    break;
+                default:
+                    throw new IOException("Desteklenmeyen arşiv türü.");
+            }
+        }
+        if (stats.kept == 0) {
+            throw new NoMatchesException("Arşivde korunabilecek bir dosya bulunamadı. Boş çıktı kaydedilmedi.");
+        }
+        progress.finish(stats);
+        return new Result(type.name(), stats.scanned, stats.kept, stats.skipped, 1);
+    }
+
 
     /** Streaming filter with cooperative cancellation and byte-weighted entry progress. */
     static Result filter(File input, String originalName, int mode, OutputStream destination,
@@ -470,6 +543,65 @@ final class ArchiveProcessor {
         }
     }
 
+private static void filterZipChannel(SeekableByteChannel source, String originalName, int mode,
+                                  EntrySink sink, Stats stats, ProgressTracker progress) throws IOException {
+        SeekableByteChannel channel = source;
+        ZipFile zip = null;
+        try {
+            zip = ZipFile.builder().setSeekableByteChannel(channel).get();
+            Set<String> directories = new HashSet<>();
+            Set<String> files = new HashSet<>();
+            long[] expanded = {0L};
+            long totalWork = 0L;
+            Enumeration<ZipArchiveEntry> countEntries = zip.getEntries();
+            while (countEntries.hasMoreElements()) {
+                progress.checkCancelled();
+                ZipArchiveEntry entry = countEntries.nextElement();
+                progress.inspectEntry(entry.getName(), stats);
+                totalWork = addWork(totalWork, progressWorkSize(entry.getName(), entry.getSize(),
+                        entry.isDirectory() || entry.isUnixSymlink(), mode));
+            }
+            progress.setTotalWork(totalWork);
+            Enumeration<ZipArchiveEntry> entries = zip.getEntries();
+            while (entries.hasMoreElements()) {
+                progress.checkCancelled();
+                ZipArchiveEntry entry = entries.nextElement();
+                stats.scanned++;
+                checkEntryLimit(stats.scanned);
+                long size = entry.isDirectory() || entry.isUnixSymlink() ? 0L : entry.getSize();
+                progress.startEntry(entry.getName(), progressWorkSize(entry.getName(), size,
+                        entry.isDirectory() || entry.isUnixSymlink(), mode), stats);
+                if (entry.isDirectory() || entry.isUnixSymlink()) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                String path = safeEntryPath(entry.getName());
+                if (path == null || !matchesMode(path, mode)) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (files.contains(path) || directories.contains(path + "/")) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (size < 0) throw new IOException("Arşiv girdisinin boyutu okunamadı: " + path);
+                sink.parentDirectories(path, directories, files);
+                files.add(path);
+                OutputStream entryOutput = sink.beginEntry(path, size, entry.getTime());
+                try (InputStream in = zip.getInputStream(entry)) {
+                    copyLimited(in, entryOutput, expanded, progress, stats);
+                }
+                completeEntry(sink, stats, progress);
+            }
+        } finally {
+            if (zip != null) zip.close();
+        }
+    }
+
+
     private static void filterRar(File primaryVolume, int mode, EntrySink sink,
                                   Stats stats, boolean missingLeadingVolume, ProgressTracker progress) throws Exception {
                                       Set<String> directories = new HashSet<>();
@@ -563,6 +695,103 @@ final class ArchiveProcessor {
         }
     }
 
+private static void filterRarChannel(SeekableByteChannel source, long sourceSize, int mode, EntrySink sink,
+                                  Stats stats, boolean missingLeadingVolume, ProgressTracker progress) throws Exception {
+                                      Set<String> directories = new HashSet<>();
+        Set<String> files = new HashSet<>();
+        long[] expanded = {0L};
+        Archive archive = new Archive(new SingleChannelVolumeManager(source, sourceSize), null, null);
+        try {
+            if (archive.getMainHeader() != null && archive.getMainHeader().isMultiVolume()) {
+                throw new IOException("Telegram'da çok parçalı RAR arşivleri desteklenmiyor.");
+            }
+            if (archive.isPasswordProtected()) throw new IOException("Parola korumalı RAR arşivleri bu sürümde desteklenmiyor.");
+            List<FileHeader> headers = archive.getFileHeaders();
+            if (headers.size() > MAX_ENTRIES) throw new IOException("Arşiv 100.000 girdiden fazla içeriyor.");
+            long totalWork = 0L;
+            boolean sizingSolidContextUnavailable = false;
+            for (FileHeader header : headers) {
+                progress.checkCancelled();
+                progress.inspectEntry(header.getFileName(), stats);
+                long size = header.isDirectory() ? 0L : header.getFullUnpackSize();
+                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
+                boolean missingContinuation = shouldSkipUnavailableRarContinuation(
+                        missingLeadingVolume, header.isSplitBefore(), rar5Entry);
+                boolean unavailableSolidEntry = shouldSkipRarEntryWithUnavailableSolidContext(
+                        sizingSolidContextUnavailable, header.isSolid());
+                boolean excluded = header.isDirectory() || header.getRedirection() != null
+                        || missingContinuation || unavailableSolidEntry;
+                long weight = excluded ? 0L : progressWorkSize(header.getFileName(), size, false, mode);
+                totalWork = addWork(totalWork, weight);
+                if (header.isDirectory() || header.getRedirection() != null) {
+                    // These entries are skipped before the solid-context state is changed below.
+                } else if (missingContinuation) {
+                    sizingSolidContextUnavailable = true;
+                } else if (!header.isSolid()) {
+                    sizingSolidContextUnavailable = false;
+                }
+            }
+            progress.setTotalWork(totalWork);
+            boolean unavailableRar5SolidContext = false;
+            for (FileHeader header : headers) {
+                progress.checkCancelled();
+                stats.scanned++;
+                checkEntryLimit(stats.scanned);
+                long size = header.isDirectory() ? 0L : header.getFullUnpackSize();
+                boolean rar5Entry = header.isRar5Container() || header.isRar5Family();
+                boolean missingContinuation = shouldSkipUnavailableRarContinuation(
+                        missingLeadingVolume, header.isSplitBefore(), rar5Entry);
+                boolean unavailableSolidEntry = shouldSkipRarEntryWithUnavailableSolidContext(
+                        unavailableRar5SolidContext, header.isSolid());
+                String path = header.isDirectory() || header.getRedirection() != null
+                        ? null : safeEntryPath(header.getFileName());
+                boolean matches = path != null && matchesMode(path, mode);
+                progress.startEntry(header.getFileName(),
+                        missingContinuation || unavailableSolidEntry || !matches ? 0L : size, stats);
+                if (header.isDirectory() || header.getRedirection() != null) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (missingContinuation) {
+                    // Junrar rejects RAR5 split-before entries when an earlier volume is absent.
+                    // Skip before opening a ZIP entry, so no empty or partial file is written.
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    unavailableRar5SolidContext = true;
+                    continue;
+                }
+                if (unavailableSolidEntry) {
+                    // A later solid entry depends on the skipped entry's decoder state. Skip until
+                    // a non-solid entry resets that state; otherwise extraction can fail CRC checks.
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (!header.isSolid()) unavailableRar5SolidContext = false;
+                if (path == null || !matches) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (files.contains(path) || directories.contains(path + "/")) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (size < 0) throw new IOException("RAR girdisinin boyutu okunamadı: " + path);
+                sink.parentDirectories(path, directories, files);
+                files.add(path);
+                OutputStream entryOutput = sink.beginEntry(path, size, 0L);
+                archive.extractFile(header, new CountingOutputStream(entryOutput, expanded, progress, stats));
+                completeEntry(sink, stats, progress);
+            }
+        } finally {
+            archive.close();
+        }
+    }
+
+
     private static void filterSevenZ(List<File> volumes, int mode, EntrySink sink,
                                      Stats stats, ProgressTracker progress) throws IOException {
         SeekableByteChannel channel = null;
@@ -628,6 +857,63 @@ final class ArchiveProcessor {
             if (channel != null) channel.close();
         }
     }
+
+private static void filterSevenZChannel(SeekableByteChannel source, int mode, EntrySink sink,
+                                     Stats stats, ProgressTracker progress) throws IOException {
+        SeekableByteChannel channel = source;
+        SevenZFile sevenZ = null;
+        try {
+            sevenZ = SevenZFile.builder().setSeekableByteChannel(channel)
+                    .setMaxMemoryLimitKiB(SEVEN_Z_MEMORY_LIMIT_KIB)
+                    .setTryToRecoverBrokenArchives(false).get();
+            Set<String> directories = new HashSet<>();
+            Set<String> files = new HashSet<>();
+            long[] expanded = {0L};
+            long totalWork = 0L;
+            for (SevenZArchiveEntry metadata : sevenZ.getEntries()) {
+                progress.checkCancelled();
+                progress.inspectEntry(metadata.getName(), stats);
+                totalWork = addWork(totalWork, progressWorkSize(metadata.getName(), metadata.getSize(),
+                        metadata.isDirectory(), mode));
+            }
+            progress.setTotalWork(totalWork);
+            SevenZArchiveEntry entry;
+            while ((entry = sevenZ.getNextEntry()) != null) {
+                progress.checkCancelled();
+                stats.scanned++;
+                checkEntryLimit(stats.scanned);
+                long size = entry.isDirectory() ? 0L : entry.getSize();
+                String path = entry.isDirectory() ? null : safeEntryPath(entry.getName());
+                boolean matches = path != null && matchesMode(path, mode);
+                progress.startEntry(entry.getName(), matches ? size : 0L, stats);
+                if (entry.isDirectory()) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (path == null || !matches) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (files.contains(path) || directories.contains(path + "/")) {
+                    stats.skipped++;
+                    progress.skipCurrent(stats);
+                    continue;
+                }
+                if (size < 0) throw new IOException("7Z girdisinin boyutu okunamadı: " + path);
+                sink.parentDirectories(path, directories, files);
+                files.add(path);
+                long time = entry.getHasLastModifiedDate() ? entry.getLastModifiedDate().getTime() : 0L;
+                OutputStream entryOutput = sink.beginEntry(path, size, time);
+                copySevenZEntry(sevenZ, entryOutput, expanded, progress, stats);
+                completeEntry(sink, stats, progress);
+            }
+        } finally {
+            if (sevenZ != null) sevenZ.close();
+        }
+    }
+
 
     /** Shared tail of every kept entry: a sink may report that the entry produced no output. */
     private static void completeEntry(EntrySink sink, Stats stats, ProgressTracker progress) throws IOException {
@@ -900,5 +1186,78 @@ final class ArchiveProcessor {
         }
         @Override public void flush() throws IOException { target.flush(); }
         @Override public void close() throws IOException { flush(); }
+    }
+
+
+    private static final class SingleChannelVolumeManager implements com.github.junrar.volume.VolumeManager {
+        private final SeekableByteChannel source;
+        private final long size;
+        private boolean opened;
+
+        SingleChannelVolumeManager(SeekableByteChannel source, long size) {
+            this.source = source;
+            this.size = size;
+        }
+
+        @Override public com.github.junrar.volume.Volume nextVolume(Archive archive,
+                com.github.junrar.volume.Volume lastVolume) throws IOException {
+            if (opened || lastVolume != null) return null;
+            opened = true;
+            return new SingleChannelVolume(archive, source, size);
+        }
+    }
+
+    private static final class SingleChannelVolume implements com.github.junrar.volume.Volume {
+        private final Archive archive;
+        private final SeekableByteChannel source;
+        private final long size;
+
+        SingleChannelVolume(Archive archive, SeekableByteChannel source, long size) {
+            this.archive = archive;
+            this.source = source;
+            this.size = size;
+        }
+
+        @Override public com.github.junrar.io.SeekableReadOnlyByteChannel getChannel() {
+            return new SingleChannelRarAdapter(source);
+        }
+        @Override public long getLength() { return size; }
+        @Override public Archive getArchive() { return archive; }
+    }
+
+    private static final class SingleChannelRarAdapter implements com.github.junrar.io.SeekableReadOnlyByteChannel {
+        private final SeekableByteChannel source;
+        private final byte[] singleByte = new byte[1];
+        private final ByteBuffer singleByteBuffer = ByteBuffer.wrap(singleByte);
+        SingleChannelRarAdapter(SeekableByteChannel source) { this.source = source; }
+        @Override public long getPosition() throws IOException { return source.position(); }
+        @Override public void setPosition(long position) throws IOException {
+            if (position < 0L) throw new IOException("RAR seek konumu negatif olamaz.");
+            source.position(position);
+        }
+        @Override public int read() throws IOException {
+            singleByteBuffer.clear();
+            int read = source.read(singleByteBuffer);
+            return read < 0 ? -1 : read == 0 ? 0 : singleByte[0] & 0xFF;
+        }
+        @Override public int read(byte[] buffer, int offset, int count) throws IOException {
+            if (buffer == null) throw new NullPointerException("buffer");
+            if (offset < 0 || count < 0 || offset > buffer.length - count) throw new IndexOutOfBoundsException();
+            if (count == 0) return 0;
+            return source.read(ByteBuffer.wrap(buffer, offset, count));
+        }
+        @Override public int readFully(byte[] buffer, int count) throws IOException {
+            if (buffer == null) throw new NullPointerException("buffer");
+            if (count < 0 || count > buffer.length) throw new IndexOutOfBoundsException();
+            int total = 0;
+            while (total < count) {
+                int read = read(buffer, total, count - total);
+                if (read < 0) throw new java.io.EOFException("RAR arşiv parçası beklenenden erken bitti.");
+                if (read == 0) continue;
+                total += read;
+            }
+            return total;
+        }
+        @Override public void close() throws IOException { source.close(); }
     }
 }
